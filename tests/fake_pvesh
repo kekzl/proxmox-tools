@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
 """Fake pvesh for tests: serves and mutates a JSON state file ($FAKE_PVE_STATE)."""
 import fcntl
 import json

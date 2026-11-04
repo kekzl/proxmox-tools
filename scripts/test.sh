@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
 # Runs the test suite in Docker against PVE 7 (py3.9) and PVE 9 (py3.13) Python versions.
 set -euo pipefail
 cd "$(dirname "$0")/.."

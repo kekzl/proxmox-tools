@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
 """pvesnap - audit and safely bulk-delete Proxmox VE snapshots (QEMU + LXC).
 
 Runs on a PVE node via pvesh, or remotely via API token. Stdlib only, Python >= 3.9.

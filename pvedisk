@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
 """pvedisk - find and safely delete orphaned Proxmox VE guest volumes, cluster-wide.
 
 Compares every images/rootdir volume on every storage with all guest configs (current,

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
 # Splices lib/shared.py into every tool between the "# ==== shared:" markers.
 set -euo pipefail
 cd "$(dirname "$0")/.."

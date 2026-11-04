@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
 """Fake 'pvesm free VOLID' for tests: removes the volume from $FAKE_PVE_STATE content lists."""
 import fcntl
 import json
