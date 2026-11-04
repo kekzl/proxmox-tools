@@ -231,8 +231,10 @@ class ApiBackend:
             url = "https://" + url
         parsed = urllib.parse.urlparse(url)
         if not parsed.port:
-            url = f"{parsed.scheme}://{parsed.hostname}:8006"
-        self.base = url.rstrip("/") + "/api2/json"
+            host = parsed.hostname or ""
+            host = f"[{host}]" if ":" in host else host  # IPv6 literal
+            parsed = parsed._replace(netloc=host + ":8006")
+        self.base = f"{parsed.scheme}://{parsed.netloc}/api2/json"
         token = token.strip()
         if token.startswith("PVEAPIToken="):
             token = token[len("PVEAPIToken="):]
@@ -289,9 +291,17 @@ def wait_task(backend, upid, timeout):
     node = upid.split(":")[1]
     path = f"/nodes/{node}/tasks/{upid}"
     deadline = time.monotonic() + timeout
-    delay = 0.5
+    delay, errors = 0.5, 0
     while True:
-        st = backend.get(path + "/status") or {}
+        try:
+            st = backend.get(path + "/status") or {}
+            errors = 0
+        except PveError:
+            # pveproxy restart or network blip: 5 consecutive poll errors are fatal, the task keeps running
+            errors += 1
+            if errors >= 5 or time.monotonic() > deadline:
+                raise
+            st = {}
         if st.get("status") == "stopped":
             break
         if time.monotonic() > deadline:
@@ -341,7 +351,11 @@ def confirm(args):
         return True
     if not sys.stdin.isatty():
         raise PveError("stdin is not a terminal: pass --yes to confirm")
-    return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+    try:
+        return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        print()
+        return False
 
 
 def common_parser():
@@ -455,14 +469,21 @@ def collect(backend, args, now):
             nodes.append(r.get("node"))
     findings = []
 
-    targets, shared_done = [], set()
+    targets, shared_done, shared_wanted = [], set(), set()
     for (node, st), r in sorted(storages.items()):
         if "backup" not in str(r.get("content") or "").split(","):
             continue
         if args.storage and st not in args.storage:
             continue
         shared = bool(_int(r.get("shared")))
-        if r.get("status") != "available" or (shared and st in shared_done):
+        if shared:
+            shared_wanted.add(st)
+        if r.get("status") != "available":
+            if not shared:
+                findings.append(Finding("INFO", None, "", "scan", f"storage {st} on {node} status "
+                                        f"'{r.get('status')}', its backups are not counted"))
+            continue
+        if shared and st in shared_done:
             continue
         if shared:
             shared_done.add(st)
@@ -473,6 +494,9 @@ def collect(backend, args, now):
             if pct > args.max_usage:
                 findings.append(Finding("WARN", None, "", "usage", f"storage {st}" + ("" if shared else f" on {node}")
                                         + f" {pct:.0f}% full ({fmt_size(disk)} / {fmt_size(maxdisk)})"))
+    for st in sorted(shared_wanted - shared_done):
+        findings.append(Finding("INFO", None, "", "scan",
+                                f"shared storage {st} not available on any node, its backups are not counted"))
 
     def fetch(t):
         node, st, _ = t
@@ -524,8 +548,9 @@ def collect(backend, args, now):
             except PveError as e:
                 return node, [], str(e)
 
+        unfiltered = args.guests is None and not args.node and not args.type and not args.name
         with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-            for node, tasks, err in ex.map(tasks_of, sorted(nodes)):
+            for node, tasks, err in ex.map(tasks_of, sorted(n for n in nodes if not args.node or n in args.node)):
                 if err:
                     findings.append(Finding("INFO", None, "", "tasks", f"cannot read tasks of {node}: {err}"))
                 for t in tasks:
@@ -533,11 +558,14 @@ def collect(backend, args, now):
                     if not t.get("endtime") or status == "OK" or status.startswith("WARNINGS"):
                         continue
                     vmid = _int(t.get("id"))
-                    if vmid is not None and args.guests is not None and vmid not in args.guests:
-                        continue
                     g = guests.get(vmid)
-                    findings.append(Finding("WARN", vmid, g.name if g else "", "failed",
-                                            f"vzdump on {node} at {fmt_time(_int(t.get('starttime')))}: {status}"))
+                    if vmid is not None and g is None and (vmid in all_vmids or not unfiltered):
+                        continue  # guest filtered out or template
+                    detail = f"vzdump on {node} at {fmt_time(_int(t.get('starttime')))}: {status}"
+                    if g and g.last and (g.last.ctime or 0) > (_int(t.get("endtime")) or 0):
+                        findings.append(Finding("INFO", vmid, g.name, "failed", detail + ", newer backup exists"))
+                    else:
+                        findings.append(Finding("WARN", vmid, g.name if g else "", "failed", detail))
     return list(guests.values()), orphans, findings, len(targets)
 
 

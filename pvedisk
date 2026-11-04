@@ -232,8 +232,10 @@ class ApiBackend:
             url = "https://" + url
         parsed = urllib.parse.urlparse(url)
         if not parsed.port:
-            url = f"{parsed.scheme}://{parsed.hostname}:8006"
-        self.base = url.rstrip("/") + "/api2/json"
+            host = parsed.hostname or ""
+            host = f"[{host}]" if ":" in host else host  # IPv6 literal
+            parsed = parsed._replace(netloc=host + ":8006")
+        self.base = f"{parsed.scheme}://{parsed.netloc}/api2/json"
         token = token.strip()
         if token.startswith("PVEAPIToken="):
             token = token[len("PVEAPIToken="):]
@@ -290,9 +292,17 @@ def wait_task(backend, upid, timeout):
     node = upid.split(":")[1]
     path = f"/nodes/{node}/tasks/{upid}"
     deadline = time.monotonic() + timeout
-    delay = 0.5
+    delay, errors = 0.5, 0
     while True:
-        st = backend.get(path + "/status") or {}
+        try:
+            st = backend.get(path + "/status") or {}
+            errors = 0
+        except PveError:
+            # pveproxy restart or network blip: 5 consecutive poll errors are fatal, the task keeps running
+            errors += 1
+            if errors >= 5 or time.monotonic() > deadline:
+                raise
+            st = {}
         if st.get("status") == "stopped":
             break
         if time.monotonic() > deadline:
@@ -342,7 +352,11 @@ def confirm(args):
         return True
     if not sys.stdin.isatty():
         raise PveError("stdin is not a terminal: pass --yes to confirm")
-    return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+    try:
+        return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        print()
+        return False
 
 
 def common_parser():

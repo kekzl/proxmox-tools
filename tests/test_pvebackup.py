@@ -78,7 +78,37 @@ class EndToEnd(StateCase):
         rc, out, _ = self.run_cli("check", "101", "--max-age", "4d", "--failed-since", "30d", "-q", "--json")
         self.assertEqual(rc, 1)
         got = sorted((f["vmid"] or 0, f["check"]) for f in json.loads(out)["findings"])
-        self.assertEqual(got, [(0, "failed"), (0, "usage"), (101, "failed")])
+        self.assertEqual(got, [(0, "failed"), (0, "usage")])  # 101 failed 20d ago, newer backup 3d ago
+        rc, out, _ = self.run_cli("check", "101", "--max-age", "4d", "--failed-since", "30d", "--json")
+        got = {(f["vmid"], f["check"], f["severity"]) for f in json.loads(out)["findings"]}
+        self.assertIn((101, "failed", "INFO"), got)
+
+    def test_failed_tasks_follow_guest_filters(self):
+        st = fixture()
+        st["node_tasks"]["pve1"].append({"type": "vzdump", "status": "ERROR: timeout", "starttime": NOW - H,
+                                         "endtime": NOW - H + 60, "id": "103"})
+        self.write(st)
+        rc, out, _ = self.run_cli("check", "--json")
+        got = {(f["vmid"], f["check"], f["severity"]) for f in json.loads(out)["findings"]}
+        self.assertIn((103, "failed", "WARN"), got)
+        for argv in (["--name", "^g100$"], ["--type", "lxc"], ["--node", "pve2"]):
+            rc, out, _ = self.run_cli("check", "--json", *argv)
+            got = {(f["vmid"], f["check"]) for f in json.loads(out)["findings"]}
+            self.assertNotIn((103, "failed"), got, argv)
+
+    def test_unavailable_storage_reported(self):
+        st = fixture()
+        for r in st["resources"]:
+            if r.get("storage") == "local" and r["node"] == "pve1":
+                r["status"] = "unknown"
+            if r.get("storage") == "pbs":
+                r["status"] = "unknown"
+        self.write(st)
+        rc, out, _ = self.run_cli("check", "--json")
+        details = [f["detail"] for f in json.loads(out)["findings"] if f["check"] == "scan"]
+        self.assertEqual(len(details), 2, details)
+        self.assertTrue(any("local on pve1 status 'unknown'" in d for d in details), details)
+        self.assertTrue(any("shared storage pbs not available on any node" in d for d in details), details)
 
     def test_coverage_unknown(self):
         st = fixture()

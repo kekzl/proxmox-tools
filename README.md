@@ -63,6 +63,7 @@ Delete selection: base set = named snapshots + `--subtree` + `--upto`, or all sn
 |---|---|
 | no selector | refused |
 | single guest + unknown snapshot name | refused |
+| multiple guests + snapshot name on none of them | refused |
 | guest locked at start | guest skipped |
 | task fails or times out (`--timeout 3600`) | rest of that guest skipped, other guests continue |
 | after run | snapshot list re-read, leftovers reported as failed |
@@ -118,8 +119,10 @@ Config source: `--config-source auto` reads `/etc/pve/nodes/*/{qemu-server,lxc}/
 | `age` last backup too old | WARN | `--max-age 26h` |
 | `count` too few backups | WARN | `--min-count 0` (off) |
 | `failed` vzdump task with error status | WARN | `--failed-since 7d` |
+| `failed` same, but a newer backup of the guest exists | INFO | same |
 | `usage` backup storage fill level | WARN | `--max-usage 85` |
 | `scan` backup storage not listable | WARN | on |
+| `scan` backup storage not available (node offline), its backups not counted | INFO | on |
 | `jobs` disabled job, coverage unknown | INFO | on |
 | `deleted-guest` backups of guests that no longer exist | INFO | on, unfiltered runs only |
 
