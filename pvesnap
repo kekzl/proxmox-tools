@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""pvesnap - audit and safely bulk-delete Proxmox VE snapshots (QEMU + LXC).
+
+Runs on a PVE node via pvesh, or remotely via API token. Stdlib only, Python >= 3.9.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import namedtuple
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+
+VERSION = "0.1.0"
+UPID_RE = re.compile(r"UPID:[^\s\"']+")
+NOW_NODE = "\0now"
+SEVERITY_RANK = {"ERROR": 0, "WARN": 1, "INFO": 2}
+AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+
+
+class PvesnapError(Exception):
+    """Fatal or per-guest error with a user-facing message."""
+
+
+# ---------------------------------------------------------------- helpers
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_age(text):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhdwy]?)\s*", str(text))
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid age '{text}' (examples: 30d, 12h, 2w, 90m)")
+    return int(float(m.group(1)) * AGE_UNITS[m.group(2) or "d"])
+
+
+def parse_idspec(text):
+    """'all' -> None, '100,105,200-210' -> set of vmids."""
+    if text in ("all", "*"):
+        return None
+    ids = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise argparse.ArgumentTypeError(f"invalid guest spec '{part}' (examples: 100, 100,101, 200-210, all)")
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if b < a or b - a > 1000000:
+            raise argparse.ArgumentTypeError(f"invalid range '{part}'")
+        ids.update(range(a, b + 1))
+    if not ids:
+        raise argparse.ArgumentTypeError("empty guest spec")
+    return ids
+
+
+def regex(text):
+    try:
+        return re.compile(text)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"invalid regex '{text}': {e}")
+
+
+def positive_int(text):
+    v = _int(text)
+    if v is None or v < 1:
+        raise argparse.ArgumentTypeError(f"expected integer >= 1, got '{text}'")
+    return v
+
+
+def fmt_age(sec):
+    if sec is None:
+        return "?"
+    sec = max(0, int(sec))
+    if sec >= 86400:
+        return f"{sec // 86400}d"
+    if sec >= 3600:
+        return f"{sec // 3600}h"
+    return f"{sec // 60}m"
+
+
+def fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def short(text, n=50):
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return line if len(line) <= n else line[: n - 3] + "..."
+
+
+class C:
+    on = False
+
+    @classmethod
+    def wrap(cls, code, s):
+        return f"\033[{code}m{s}\033[0m" if cls.on and s else s
+
+    @classmethod
+    def red(cls, s):
+        return cls.wrap("31", s)
+
+    @classmethod
+    def yellow(cls, s):
+        return cls.wrap("33", s)
+
+    @classmethod
+    def green(cls, s):
+        return cls.wrap("32", s)
+
+    @classmethod
+    def dim(cls, s):
+        return cls.wrap("2", s)
+
+    @classmethod
+    def bold(cls, s):
+        return cls.wrap("1", s)
+
+
+SEV_COLOR = {"ERROR": C.red, "WARN": C.yellow, "INFO": C.dim}
+
+
+def print_table(headers, rows, colorize=None):
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    last = len(headers) - 1
+    print("  ".join(h if i == last else h.ljust(widths[i]) for i, h in enumerate(headers)))
+    for r in rows:
+        cells = []
+        for i, cell in enumerate(r):
+            s = str(cell) if i == last else str(cell).ljust(widths[i])
+            cells.append(colorize(i, str(cell), s) if colorize else s)
+        print("  ".join(cells).rstrip())
+
+
+# ---------------------------------------------------------------- backends
+
+class PveshBackend:
+    """Local node: pvesh proxies calls to other cluster nodes itself."""
+
+    local = True
+
+    def __init__(self, binary="pvesh"):
+        self.binary = binary
+
+    def _run(self, method, path, params):
+        cmd = [self.binary, method, path, "--output-format", "json"]
+        for k, v in params.items():
+            cmd += ["--" + k, str(v)]
+        try:
+            # own session: Ctrl-C must not kill a running pvesh worker mid-delete
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, start_new_session=True)
+        except OSError as e:
+            raise PvesnapError(f"cannot run {self.binary}: {e}") from e
+        if p.returncode != 0:
+            msg = " | ".join(l.strip() for l in (p.stderr or p.stdout).strip().splitlines() if l.strip())
+            raise PvesnapError(f"pvesh {method} {path}: {msg or 'exit code ' + str(p.returncode)}")
+        return p.stdout
+
+    def get(self, path, **params):
+        out = self._run("get", path, params).strip()
+        if not out:
+            return None
+        try:
+            return json.loads(out)
+        except ValueError as e:
+            raise PvesnapError(f"pvesh get {path}: invalid JSON: {e}") from e
+
+    def delete(self, path, **params):
+        m = UPID_RE.search(self._run("delete", path, params))
+        return m.group(0) if m else None
+
+
+class ApiBackend:
+    """Remote: https://host:8006 with an API token (USER@REALM!ID=SECRET)."""
+
+    local = False
+
+    def __init__(self, url, token, verify=True):
+        if "://" not in url:
+            url = "https://" + url
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.port:
+            url = f"{parsed.scheme}://{parsed.hostname}:8006"
+        self.base = url.rstrip("/") + "/api2/json"
+        token = token.strip()
+        if token.startswith("PVEAPIToken="):
+            token = token[len("PVEAPIToken="):]
+        self.headers = {"Authorization": "PVEAPIToken=" + token, "Accept": "application/json"}
+        self.ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
+
+    def _req(self, method, path, params):
+        url = self.base + urllib.parse.quote(path, safe="/")
+        q = urllib.parse.urlencode(params)
+        if q:
+            url += "?" + q
+        req = urllib.request.Request(url, method=method, headers=self.headers)
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=120) as r:
+                return json.load(r).get("data")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace").strip()
+            raise PvesnapError(f"{method} {path}: HTTP {e.code} {e.reason} {body}".strip()) from e
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise PvesnapError(f"{method} {path}: {e}") from e
+
+    def get(self, path, **params):
+        return self._req("GET", path, params)
+
+    def delete(self, path, **params):
+        data = self._req("DELETE", path, params)
+        m = UPID_RE.search(str(data or ""))
+        return m.group(0) if m else None
+
+
+def make_backend(args):
+    if args.api_url:
+        if not args.token:
+            raise PvesnapError("--api-url needs --token or PVESNAP_TOKEN")
+        return ApiBackend(args.api_url, args.token, verify=not args.insecure)
+    if shutil.which(args.pvesh) or os.path.isfile(args.pvesh):
+        return PveshBackend(args.pvesh)
+    raise PvesnapError("pvesh not found: run on a Proxmox VE node or set "
+                       "--api-url/--token (env PVESNAP_API_URL, PVESNAP_TOKEN)")
+
+
+# ---------------------------------------------------------------- model
+
+@dataclass
+class Snap:
+    name: str
+    parent: str | None = None
+    snaptime: int | None = None
+    description: str = ""
+    vmstate: bool = False
+    snapstate: str | None = None
+    children: list = field(default_factory=list)
+    depth: int = 0
+
+
+@dataclass
+class Guest:
+    vmid: int
+    node: str
+    type: str
+    name: str = ""
+    status: str = ""
+    lock: str | None = None
+    template: bool = False
+    snaps: dict = field(default_factory=dict)
+    current_parent: str | None = None
+    error: str | None = None
+    broken: list = field(default_factory=list)
+    cyclic: list = field(default_factory=list)
+
+    @property
+    def path(self):
+        return f"/nodes/{self.node}/{self.type}/{self.vmid}"
+
+    @property
+    def tool(self):
+        return "qm" if self.type == "qemu" else "pct"
+
+
+def build_tree(g, entries):
+    g.snaps, g.broken, g.cyclic, g.current_parent = {}, [], [], None
+    for e in entries:
+        name = e.get("name")
+        if not name:
+            continue
+        if name == "current":
+            g.current_parent = e.get("parent") or None
+            continue
+        g.snaps[name] = Snap(
+            name=name,
+            parent=e.get("parent") or None,
+            snaptime=_int(e.get("snaptime")) or None,
+            description=(e.get("description") or "").strip(),
+            vmstate=bool(_int(e.get("vmstate"))),
+            snapstate=e.get("snapstate") or None,
+        )
+    for s in g.snaps.values():
+        if s.parent in g.snaps:
+            g.snaps[s.parent].children.append(s.name)
+        elif s.parent:
+            g.broken.append((s.name, s.parent))
+    for s in g.snaps.values():
+        s.children.sort(key=lambda n: (g.snaps[n].snaptime or 0, n))
+        depth, cur, seen = 0, s.name, set()
+        while cur in g.snaps and cur not in seen:
+            seen.add(cur)
+            depth += 1
+            cur = g.snaps[cur].parent
+        if cur in seen:
+            g.cyclic.append(s.name)
+        s.depth = depth
+    return g
+
+
+def chain_depth(g):
+    """Snapshots between the live state (NOW) and its root."""
+    s = g.snaps.get(g.current_parent)
+    return s.depth if s else 0
+
+
+def ancestors(g, name):
+    out, cur = [], name
+    while cur in g.snaps and cur not in out:
+        out.append(cur)
+        cur = g.snaps[cur].parent
+    return out
+
+
+def descendants(g, name):
+    out, stack = [], [name]
+    while stack:
+        cur = stack.pop()
+        if cur in g.snaps and cur not in out:
+            out.append(cur)
+            stack.extend(g.snaps[cur].children)
+    return out
+
+
+def load_guests(backend, args):
+    res = backend.get("/cluster/resources", type="vm") or []
+    all_vmids, guests = set(), []
+    for r in res:
+        if r.get("type") not in ("qemu", "lxc"):
+            continue
+        vmid = _int(r.get("vmid"))
+        if vmid is None:
+            continue
+        all_vmids.add(vmid)
+        if args.guests is not None and vmid not in args.guests:
+            continue
+        if args.node and r.get("node") not in args.node:
+            continue
+        if args.type and r["type"] != args.type:
+            continue
+        if args.name and not args.name.search(r.get("name") or ""):
+            continue
+        guests.append(Guest(vmid=vmid, node=r.get("node") or "", type=r["type"], name=r.get("name") or "",
+                            status=r.get("status") or "", lock=r.get("lock") or None,
+                            template=bool(_int(r.get("template")))))
+    guests.sort(key=lambda g: g.vmid)
+
+    def fetch(g):
+        try:
+            build_tree(g, backend.get(g.path + "/snapshot") or [])
+        except PvesnapError as e:
+            g.error = str(e)
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        list(ex.map(fetch, guests))
+    return guests, all_vmids
+
+
+def guest_json(g, now):
+    return {
+        "vmid": g.vmid, "name": g.name, "node": g.node, "type": g.type, "status": g.status,
+        "lock": g.lock, "template": g.template, "error": g.error,
+        "current_parent": g.current_parent, "chain_depth": chain_depth(g),
+        "snapshots": [
+            {"name": s.name, "parent": s.parent, "snaptime": s.snaptime,
+             "age_seconds": int(now - s.snaptime) if s.snaptime else None,
+             "vmstate": s.vmstate, "snapstate": s.snapstate, "depth": s.depth,
+             "description": s.description}
+            for s in sorted(g.snaps.values(), key=lambda s: (s.snaptime or 0, s.depth))
+        ],
+    }
+
+
+# ---------------------------------------------------------------- rendering
+
+def tree_rows(g):
+    kids = {n: list(s.children) for n, s in g.snaps.items()}
+    roots = sorted((n for n, s in g.snaps.items() if not s.parent or s.parent not in g.snaps),
+                   key=lambda n: (g.snaps[n].snaptime or 0, n))
+    if g.current_parent in g.snaps:
+        kids[g.current_parent].append(NOW_NODE)
+    else:
+        roots.append(NOW_NODE)
+    rows, seen = [], set()
+
+    def walk(n, prefix, connector):
+        rows.append((prefix + connector, n))
+        if n == NOW_NODE or n in seen:
+            return
+        seen.add(n)
+        if connector == "":
+            child_prefix = prefix
+        else:
+            child_prefix = prefix + ("   " if connector == "└─ " else "│  ")
+        ch = kids[n]
+        for i, c in enumerate(ch):
+            walk(c, child_prefix, "└─ " if i == len(ch) - 1 else "├─ ")
+
+    for r in roots:
+        walk(r, "", "")
+    for n in g.snaps:
+        if n not in seen:
+            rows.append(("?? ", n))
+    return rows
+
+
+def guest_header(g):
+    bits = [g.type, g.node, g.status or "?"] + (["template"] if g.template else [])
+    head = f"{C.bold(str(g.vmid))} {g.name}  ({', '.join(bits)})"
+    if g.lock:
+        head += "  " + C.red(f"LOCK={g.lock}")
+    if g.error:
+        return head + "  " + C.red("ERROR: " + g.error)
+    return head + f"  {len(g.snaps)} snapshot(s), chain depth {chain_depth(g)}"
+
+
+def print_tree(g, now, marks=None):
+    print(guest_header(g))
+    if g.error:
+        return
+    rows = tree_rows(g)
+    labels = [p + ("NOW" if n == NOW_NODE else n) for p, n in rows]
+    width = max(len(l) for l in labels)
+    for (prefix, n), label in zip(rows, labels):
+        mark = "" if marks is None else (C.red("DEL ") if n in marks else "    ")
+        if n == NOW_NODE:
+            print(f"  {mark}{prefix}{C.green('NOW')}")
+            continue
+        s = g.snaps[n]
+        age = fmt_age(now - s.snaptime) if s.snaptime else "?"
+        extra = []
+        if s.vmstate:
+            extra.append("RAM")
+        if s.snapstate:
+            extra.append(C.red(f"snapstate={s.snapstate}"))
+        if s.description:
+            extra.append(C.dim(short(s.description)))
+        print(f"  {mark}{label.ljust(width)}  {fmt_time(s.snaptime):16}  {age:>5}  {'  '.join(extra)}".rstrip())
+
+
+# ---------------------------------------------------------------- list
+
+def cmd_list(backend, args):
+    guests, _ = load_guests(backend, args)
+    now = time.time()
+    if args.json:
+        print(json.dumps([guest_json(g, now) for g in guests], indent=2))
+        return 0
+    shown = [g for g in guests if g.snaps or g.error or g.lock or args.empty]
+    if args.flat:
+        rows = []
+        for g in shown:
+            for s in sorted(g.snaps.values(), key=lambda s: (s.snaptime or 0, s.depth)):
+                rows.append([g.vmid, g.name, g.node, s.name, s.parent or "-", fmt_time(s.snaptime),
+                             fmt_age(now - s.snaptime) if s.snaptime else "?",
+                             "yes" if s.vmstate else "", s.depth, short(s.description, 40)])
+        print_table(["VMID", "NAME", "NODE", "SNAPSHOT", "PARENT", "CREATED", "AGE", "RAM", "DEPTH",
+                     "DESCRIPTION"], rows)
+    else:
+        for g in shown:
+            print_tree(g, now)
+            print()
+    hidden = len(guests) - len(shown)
+    total = sum(len(g.snaps) for g in guests)
+    note = f", {hidden} without snapshots hidden (-e shows them)" if hidden else ""
+    print(f"{len(guests)} guest(s), {total} snapshot(s){note}")
+    return 1 if any(g.error for g in guests) else 0
+
+
+# ---------------------------------------------------------------- check
+
+Finding = namedtuple("Finding", "severity vmid name check detail")
+StorageSnap = namedtuple("StorageSnap", "kind ref vmid snap state")
+
+DISK_RE = re.compile(r"^(?:vm|base|subvol|basevol)-(\d+)-disk-\d+$")
+STATE_RE = re.compile(r"^vm-(\d+)-state-(.+)$")
+LVSNAP_RE = re.compile(r"^snap_(?:vm|base)-(\d+)-disk-\d+_(.+)$")
+IGNORED_STORAGE_SNAP = re.compile(r"^(__replicate_.*|__migration__)$")
+
+
+def parse_zfs_snapshots(text):
+    out = []
+    for line in text.splitlines():
+        name = line.strip()
+        ds, sep, snap = name.partition("@")
+        m = DISK_RE.match(ds.rsplit("/", 1)[-1]) if sep else None
+        if m and not IGNORED_STORAGE_SNAP.match(snap):
+            out.append(StorageSnap("zfs snapshot", name, int(m.group(1)), snap, False))
+    return out
+
+
+def parse_zfs_volumes(text):
+    out = []
+    for line in text.splitlines():
+        name = line.strip()
+        m = STATE_RE.match(name.rsplit("/", 1)[-1])
+        if m:
+            out.append(StorageSnap("zfs state volume", name, int(m.group(1)), m.group(2), True))
+    return out
+
+
+def parse_lvs(text):
+    out = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        vg, lv = parts
+        m = LVSNAP_RE.match(lv)
+        if m:
+            out.append(StorageSnap("lvm-thin snapshot", f"{vg}/{lv}", int(m.group(1)), m.group(2), False))
+            continue
+        m = STATE_RE.match(lv)
+        if m:
+            out.append(StorageSnap("lvm state volume", f"{vg}/{lv}", int(m.group(1)), m.group(2), True))
+    return out
+
+
+def _capture(cmd):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    if p.returncode != 0:
+        raise PvesnapError(f"{' '.join(cmd)}: {p.stderr.strip()}")
+    return p.stdout
+
+
+def scan_storage():
+    items, errors = [], []
+    scans = []
+    if shutil.which("zfs"):
+        scans += [(["zfs", "list", "-H", "-o", "name", "-t", "snapshot"], parse_zfs_snapshots),
+                  (["zfs", "list", "-H", "-o", "name", "-t", "volume"], parse_zfs_volumes)]
+    if shutil.which("lvs"):
+        scans.append((["lvs", "--noheadings", "-o", "vg_name,lv_name"], parse_lvs))
+    for cmd, parser in scans:
+        try:
+            items += parser(_capture(cmd))
+        except (PvesnapError, OSError) as e:
+            errors.append(str(e))
+    return items, errors, bool(scans)
+
+
+def check_orphans(backend, guests, all_vmids, args, scanner=scan_storage):
+    if not backend.local:
+        raise PvesnapError("--orphans scans local zfs/lvm and needs the pvesh backend (run it on the node)")
+    items, errors, scanned = scanner()
+    out = [Finding("INFO", None, "", "orphans", e) for e in errors]
+    if not scanned:
+        out.append(Finding("INFO", None, "", "orphans", "neither zfs nor lvs found, nothing scanned"))
+    unfiltered = args.guests is None and not args.node and not args.type and not args.name
+    by_vmid = {g.vmid: g for g in guests}
+    for it in items:
+        if it.vmid not in all_vmids:
+            if unfiltered:
+                out.append(Finding("WARN", it.vmid, "", "orphan", f"{it.kind} {it.ref}: guest does not exist"))
+            continue
+        g = by_vmid.get(it.vmid)
+        if g is None or g.error:
+            continue
+        s = g.snaps.get(it.snap)
+        if s is None:
+            out.append(Finding("WARN", g.vmid, g.name, "orphan",
+                               f"{it.kind} {it.ref}: snapshot '{it.snap}' not in guest config"))
+        elif it.state and not s.vmstate:
+            out.append(Finding("WARN", g.vmid, g.name, "orphan",
+                               f"{it.kind} {it.ref}: snapshot '{it.snap}' has no RAM state in config"))
+    return out
+
+
+def run_checks(guests, args, now, tasks):
+    running = {str(t.get("id")) for t in tasks if not t.get("endtime")}
+    out = []
+    for g in guests:
+        def add(sev, check, detail):
+            out.append(Finding(sev, g.vmid, g.name, check, detail))
+
+        if g.error:
+            add("ERROR", "fetch", g.error)
+            continue
+        if g.lock:
+            if str(g.vmid) in running:
+                add("INFO", "lock", f"locked '{g.lock}', task running")
+            else:
+                add("WARN", "lock", f"locked '{g.lock}' without running task: stale? '{g.tool} unlock {g.vmid}' "
+                                    f"on node {g.node}")
+        for snap, parent in g.broken:
+            add("ERROR", "parent", f"snapshot '{snap}' references missing parent '{parent}'")
+        if g.current_parent and g.current_parent not in g.snaps:
+            add("ERROR", "parent", f"live state references missing parent '{g.current_parent}'")
+        if g.cyclic:
+            add("ERROR", "cycle", f"parent loop through: {', '.join(sorted(g.cyclic))}")
+        for s in sorted(g.snaps.values(), key=lambda s: (s.snaptime or 0, s.name)):
+            if s.snapstate:
+                add("ERROR", "snapstate", f"snapshot '{s.name}' stuck in snapstate={s.snapstate}: "
+                                          f"pvesnap delete {g.vmid} {s.name} --force")
+            if args.max_age and s.snaptime and now - s.snaptime > args.max_age:
+                add("WARN", "age", f"snapshot '{s.name}' is {fmt_age(now - s.snaptime)} old "
+                                   f"(> {fmt_age(args.max_age)})")
+            if not s.snaptime:
+                add("INFO", "age", f"snapshot '{s.name}' has no timestamp")
+            if s.vmstate:
+                add("INFO", "vmstate", f"snapshot '{s.name}' includes RAM state")
+        depth = chain_depth(g)
+        if args.max_depth and depth > args.max_depth:
+            add("WARN", "depth", f"chain depth {depth} (> {args.max_depth})")
+        if args.max_count and len(g.snaps) > args.max_count:
+            add("WARN", "count", f"{len(g.snaps)} snapshots (> {args.max_count})")
+    return out
+
+
+def cmd_check(backend, args):
+    guests, all_vmids = load_guests(backend, args)
+    now = time.time()
+    try:
+        tasks = backend.get("/cluster/tasks") or []
+    except PvesnapError:
+        tasks = []
+    findings = run_checks(guests, args, now, tasks)
+    if args.orphans:
+        findings += check_orphans(backend, guests, all_vmids, args)
+    if args.quiet:
+        findings = [f for f in findings if f.severity != "INFO"]
+    findings.sort(key=lambda f: (SEVERITY_RANK[f.severity], f.vmid or 0, f.check))
+    counts = {k: sum(1 for f in findings if f.severity == k) for k in SEVERITY_RANK}
+    total = sum(len(g.snaps) for g in guests)
+    if args.json:
+        print(json.dumps({
+            "summary": {"guests": len(guests), "snapshots": total, **{k.lower(): v for k, v in counts.items()}},
+            "findings": [f._asdict() for f in findings],
+        }, indent=2))
+    else:
+        if findings:
+            rows = [[f.severity, f.vmid if f.vmid is not None else "-", f.name or "-", f.check, f.detail]
+                    for f in findings]
+            print_table(["SEV", "VMID", "NAME", "CHECK", "DETAIL"], rows,
+                        colorize=lambda i, raw, s: SEV_COLOR[raw](s) if i == 0 else s)
+            print()
+        print(f"{len(guests)} guest(s), {total} snapshot(s): {counts['ERROR']} error, {counts['WARN']} warn, "
+              f"{counts['INFO']} info")
+    if args.fail_on == "never":
+        return 0
+    if counts["ERROR"] or (args.fail_on == "warn" and counts["WARN"]):
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------- delete
+
+def has_selector(args):
+    return bool(args.snapshots or args.subtree or args.upto or args.all or args.older_than is not None
+                or args.match or args.keep_last)
+
+
+def select_snapshots(g, args, now):
+    """Returns (names oldest first, missing explicit names)."""
+    names, missing = set(), []
+    for n in args.snapshots:
+        (names.add(n) if n in g.snaps else missing.append(n))
+    for n in args.subtree:
+        (names.update(descendants(g, n)) if n in g.snaps else missing.append(n))
+    for n in args.upto:
+        (names.update(ancestors(g, n)) if n in g.snaps else missing.append(n))
+    if args.all or not (args.snapshots or args.subtree or args.upto):
+        names = set(g.snaps)
+
+    def pattern_ok(n):
+        return (not args.match or args.match.search(n)) and not (args.exclude and args.exclude.search(n))
+
+    names = {n for n in names if pattern_ok(n)}
+    if args.older_than is not None:
+        names = {n for n in names if g.snaps[n].snaptime and now - g.snaps[n].snaptime >= args.older_than}
+    if args.keep_last:
+        pool = sorted((s for s in g.snaps.values() if pattern_ok(s.name)),
+                      key=lambda s: (s.snaptime or 0, s.depth), reverse=True)
+        names -= {s.name for s in pool[: args.keep_last]}
+    order = sorted(names, key=lambda n: (g.snaps[n].snaptime or 0, g.snaps[n].depth, n))
+    return order, missing
+
+
+def wait_task(backend, upid, timeout):
+    node = upid.split(":")[1]
+    path = f"/nodes/{node}/tasks/{upid}"
+    deadline = time.monotonic() + timeout
+    delay = 0.5
+    while True:
+        st = backend.get(path + "/status") or {}
+        if st.get("status") == "stopped":
+            break
+        if time.monotonic() > deadline:
+            raise PvesnapError(f"task still running after {timeout}s, guest stays locked until it ends: {upid}")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5)
+    es = str(st.get("exitstatus", ""))
+    if es == "OK":
+        return ""
+    if es.startswith("WARNINGS"):
+        return f" [{es}]"
+    tail = ""
+    try:
+        log = backend.get(path + "/log", limit=1000) or []
+        lines = [str(e.get("t", "")) for e in log if e.get("t")][-5:]
+        tail = (" | " + " | ".join(lines)) if lines else ""
+    except PvesnapError:
+        pass
+    raise PvesnapError(f"task failed: {es}{tail}")
+
+
+def delete_snapshot(backend, g, name, force, timeout):
+    params = {"force": 1} if force else {}
+    upid = backend.delete(f"{g.path}/snapshot/{name}", **params)
+    return wait_task(backend, upid, timeout) if upid else ""
+
+
+class Stopper:
+    def __init__(self):
+        self.stop = False
+
+    def __call__(self, signum, frame):
+        if self.stop:
+            raise KeyboardInterrupt
+        self.stop = True
+        print("\nstopping after the running deletion(s), Ctrl-C again aborts", file=sys.stderr, flush=True)
+
+
+def execute_plan(backend, plan, args):
+    out_lock = threading.Lock()
+    stopper = Stopper()
+
+    def log(g, msg):
+        with out_lock:
+            print(f"[{g.vmid}] {msg}", flush=True)
+
+    def work(item):
+        g, names = item
+        done = []
+        try:
+            st = backend.get(g.path + "/status/current") or {}
+        except PvesnapError as e:
+            log(g, C.red(f"SKIP guest: {e}"))
+            return 0, 0, len(names)
+        if st.get("lock"):
+            log(g, C.red(f"SKIP guest: locked '{st['lock']}' (running task or stale: '{g.tool} unlock {g.vmid}')"))
+            return 0, 0, len(names)
+        for i, n in enumerate(names, 1):
+            if stopper.stop:
+                log(g, f"stopped, {len(names) - i + 1} snapshot(s) left")
+                return len(done), 0, len(names) - i + 1
+            t0 = time.monotonic()
+            log(g, f"({i}/{len(names)}) deleting '{n}' ...")
+            try:
+                warn = delete_snapshot(backend, g, n, args.force, args.timeout)
+            except PvesnapError as e:
+                log(g, C.red(f"FAILED '{n}': {e}"))
+                if len(names) - i:
+                    log(g, f"skipping remaining {len(names) - i} snapshot(s) of this guest")
+                return len(done), 1, len(names) - i
+            done.append(n)
+            log(g, C.green(f"deleted '{n}'") + f" ({time.monotonic() - t0:.0f}s){warn}")
+        try:
+            left = set(done) & {e.get("name") for e in backend.get(g.path + "/snapshot") or []}
+        except PvesnapError as e:
+            log(g, C.yellow(f"verify failed: {e}"))
+            left = set()
+        if left:
+            log(g, C.red(f"still present after delete: {', '.join(sorted(left))}"))
+            return len(done) - len(left), len(left), 0
+        return len(done), 0, 0
+
+    old = signal.signal(signal.SIGINT, stopper)
+    try:
+        if args.parallel > 1:
+            with ThreadPoolExecutor(max_workers=args.parallel) as ex:
+                results = list(ex.map(work, plan))
+        else:
+            results = [work(item) for item in plan]
+    finally:
+        signal.signal(signal.SIGINT, old)
+    ok, failed, skipped = (sum(r[i] for r in results) for i in range(3))
+    print(f"\ndeleted {ok}, failed {failed}, skipped {skipped}")
+    return 0 if not failed and not skipped else 1
+
+
+def cmd_delete(backend, args):
+    if not has_selector(args):
+        raise PvesnapError("nothing selected: name snapshots or use --subtree/--upto/--all/--older-than/"
+                           "--match/--keep-last")
+    guests, _ = load_guests(backend, args)
+    strict = args.guests is not None and len(args.guests) == 1
+    if strict and not guests:
+        raise PvesnapError(f"guest {next(iter(args.guests))} not found (or filtered out)")
+    now = time.time()
+    plan, errors = [], 0
+    for g in guests:
+        if g.error:
+            print(f"[{g.vmid}] " + C.red(f"cannot read snapshots: {g.error}"), file=sys.stderr)
+            errors += 1
+            continue
+        names, missing = select_snapshots(g, args, now)
+        if missing and strict:
+            raise PvesnapError(f"{g.vmid}: snapshot(s) not found: {', '.join(missing)}")
+        if names:
+            plan.append((g, names))
+    if not plan:
+        print("nothing to delete")
+        return 1 if errors else 0
+    for g, names in plan:
+        print_tree(g, now, marks=set(names))
+        print()
+    total = sum(len(n) for _, n in plan)
+    print(f"plan: delete {total} snapshot(s) on {len(plan)} guest(s), oldest first"
+          + (", --force" if args.force else ""))
+    if args.dry_run:
+        print("dry run: nothing deleted")
+        return 1 if errors else 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise PvesnapError("stdin is not a terminal: pass --yes to confirm")
+        if input("proceed? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return 1
+    rc = execute_plan(backend, plan, args)
+    return 1 if errors else rc
+
+
+# ---------------------------------------------------------------- cli
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    conn = common.add_argument_group("connection (default: local pvesh)")
+    conn.add_argument("--api-url", default=os.environ.get("PVESNAP_API_URL"),
+                      help="remote API, e.g. https://pve1:8006 (env PVESNAP_API_URL)")
+    conn.add_argument("--token", default=os.environ.get("PVESNAP_TOKEN"),
+                      help="API token USER@REALM!ID=SECRET (env PVESNAP_TOKEN)")
+    conn.add_argument("--insecure", action="store_true",
+                      default=os.environ.get("PVESNAP_INSECURE", "") not in ("", "0"),
+                      help="skip TLS verification (env PVESNAP_INSECURE=1)")
+    conn.add_argument("--pvesh", default="pvesh", help="pvesh binary (default: pvesh)")
+    common.add_argument("-j", "--jobs", type=positive_int, default=8, help="parallel API reads (default 8)")
+    common.add_argument("--no-color", action="store_true", help="no ANSI colors (also env NO_COLOR)")
+
+    filt = argparse.ArgumentParser(add_help=False)
+    fg = filt.add_argument_group("guest filters")
+    fg.add_argument("--node", action="append", help="only guests on this node (repeatable)")
+    fg.add_argument("--type", choices=["qemu", "lxc"], help="only VMs or containers")
+    fg.add_argument("--name", type=regex, help="regex on guest name")
+
+    p = argparse.ArgumentParser(prog="pvesnap", description=__doc__.splitlines()[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog="GUESTS: 100 | 100,101 | 200-210 | all")
+    p.add_argument("--version", action="version", version=f"pvesnap {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.required = True
+
+    sp = sub.add_parser("list", parents=[common, filt], help="show snapshot trees")
+    sp.add_argument("guests", nargs="?", default="all", type=parse_idspec, metavar="GUESTS")
+    sp.add_argument("--flat", action="store_true", help="one table row per snapshot")
+    sp.add_argument("--json", action="store_true", help="JSON output")
+    sp.add_argument("-e", "--empty", action="store_true", help="also show guests without snapshots")
+
+    sp = sub.add_parser("check", parents=[common, filt], help="audit snapshots, exit 1 on findings",
+                        description="Checks: stale locks, broken parents, stuck snapstate, age, chain depth, "
+                                    "count, RAM state, storage orphans (--orphans).")
+    sp.add_argument("guests", nargs="?", default="all", type=parse_idspec, metavar="GUESTS")
+    sp.add_argument("--max-age", type=parse_age, default=parse_age("30d"), help="warn above age (default 30d, 0=off)")
+    sp.add_argument("--max-depth", type=int, default=5, help="warn above chain depth (default 5, 0=off)")
+    sp.add_argument("--max-count", type=int, default=0, help="warn above snapshots per guest (default 0=off)")
+    sp.add_argument("--orphans", action="store_true",
+                    help="scan local zfs/lvm-thin for snapshots missing in guest configs")
+    sp.add_argument("--fail-on", choices=["warn", "error", "never"], default="warn",
+                    help="exit 1 threshold (default warn)")
+    sp.add_argument("-q", "--quiet", action="store_true", help="hide INFO findings")
+    sp.add_argument("--json", action="store_true", help="JSON output")
+
+    sp = sub.add_parser("delete", parents=[common, filt], help="delete snapshots, chains or by age",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description="Selection = named snapshots + --subtree + --upto (or all snapshots if none "
+                                    "given),\nthen narrowed by --match/--exclude/--older-than, minus --keep-last.\n"
+                                    "Deletes oldest first, one task at a time per guest, waits for every task.",
+                        epilog="examples:\n"
+                               "  pvesnap delete 100 pre-upgrade\n"
+                               "  pvesnap delete 100 --upto weekly-3        # weekly-3 and all older in its chain\n"
+                               "  pvesnap delete 100 --subtree test-branch  # snapshot and all its descendants\n"
+                               "  pvesnap delete all --older-than 30d --dry-run\n"
+                               "  pvesnap delete all --match '^auto' --keep-last 7 -y")
+    sp.add_argument("guests", type=parse_idspec, metavar="GUESTS")
+    sp.add_argument("snapshots", nargs="*", metavar="SNAPSHOT", help="snapshot names")
+    sel = sp.add_argument_group("selection")
+    sel.add_argument("--subtree", action="append", default=[], metavar="SNAP",
+                     help="SNAP and all its descendants (repeatable)")
+    sel.add_argument("--upto", action="append", default=[], metavar="SNAP",
+                     help="SNAP and all its ancestors = older part of the chain (repeatable)")
+    sel.add_argument("--all", action="store_true", help="all snapshots of the selected guests")
+    sel.add_argument("--older-than", type=parse_age, metavar="AGE", help="only older than AGE (30d, 12h, 2w)")
+    sel.add_argument("--match", type=regex, metavar="RE", help="only names matching regex")
+    sel.add_argument("--exclude", type=regex, metavar="RE", help="never names matching regex")
+    sel.add_argument("--keep-last", type=positive_int, metavar="N",
+                     help="protect the newest N snapshots (among --match/--exclude)")
+    ex = sp.add_argument_group("execution")
+    ex.add_argument("-n", "--dry-run", action="store_true", help="show the plan only")
+    ex.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
+    ex.add_argument("--force", action="store_true",
+                    help="drop from config even if removing the storage snapshot fails (stuck snapstate)")
+    ex.add_argument("--timeout", type=positive_int, default=3600, help="seconds per task (default 3600)")
+    ex.add_argument("--parallel", type=positive_int, default=1, help="guests processed concurrently (default 1)")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    C.on = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    if args.cmd in ("list", "check") and hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        backend = make_backend(args)
+        return {"list": cmd_list, "check": cmd_check, "delete": cmd_delete}[args.cmd](backend, args)
+    except PvesnapError as e:
+        print(f"pvesnap: error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
