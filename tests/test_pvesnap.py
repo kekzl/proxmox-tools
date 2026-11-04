@@ -1,24 +1,11 @@
 import argparse
-import importlib.machinery
-import importlib.util
 import json
-import os
-import subprocess
-import sys
-import tempfile
 import time
 import unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-SCRIPT = os.path.join(ROOT, "pvesnap")
-FAKE = os.path.join(HERE, "fake_pvesh")
+from helpers import StateCase, load_tool
 
-_loader = importlib.machinery.SourceFileLoader("pvesnap", SCRIPT)
-_spec = importlib.util.spec_from_loader("pvesnap", _loader)
-P = importlib.util.module_from_spec(_spec)
-sys.modules["pvesnap"] = P
-_loader.exec_module(P)
+P = load_tool("pvesnap")
 
 NOW = int(time.time())
 DAY = 86400
@@ -184,33 +171,14 @@ class CheckTests(unittest.TestCase):
                           "zfs state volume r/vm-100-state-b"])
 
 
-class EndToEnd(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.state = os.path.join(self.tmp.name, "state.json")
-        self.write(fixture())
+class EndToEnd(StateCase):
+    tool = "pvesnap"
 
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def write(self, st):
-        with open(self.state, "w") as f:
-            json.dump(st, f)
-
-    def read(self):
-        with open(self.state) as f:
-            return json.load(f)
-
-    def run_cli(self, *argv):
-        env = dict(os.environ, FAKE_PVE_STATE=self.state, NO_COLOR="1")
-        env.pop("PVESNAP_API_URL", None)
-        p = subprocess.run([sys.executable, SCRIPT] + list(argv[:1]) + ["--pvesh", FAKE] + list(argv[1:]),
-                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           universal_newlines=True, env=env, timeout=60)
-        return p.returncode, p.stdout, p.stderr
+    def fixture(self):
+        return fixture()
 
     def deletes(self):
-        return [c[1].rsplit("/", 1)[-1] for c in self.read()["calls"] if c[0] == "delete"]
+        return [c[1].rsplit("/", 1)[-1] for c in self.calls("delete")]
 
     def test_list_tree(self):
         rc, out, err = self.run_cli("list")

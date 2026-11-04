@@ -23,18 +23,18 @@ from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-VERSION = "0.1.0"
-UPID_RE = re.compile(r"UPID:[^\s\"']+")
+VERSION = "0.2.0"
 NOW_NODE = "\0now"
+
+# ==== shared:begin
+UPID_RE = re.compile(r"UPID:[^\s\"']+")
 SEVERITY_RANK = {"ERROR": 0, "WARN": 1, "INFO": 2}
 AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
 
 
-class PvesnapError(Exception):
-    """Fatal or per-guest error with a user-facing message."""
+class PveError(Exception):
+    """Fatal or per-item error with a user-facing message."""
 
-
-# ---------------------------------------------------------------- helpers
 
 def _int(v):
     try:
@@ -89,7 +89,7 @@ def fmt_age(sec):
     if sec is None:
         return "?"
     sec = max(0, int(sec))
-    if sec >= 86400:
+    if sec >= 172800:
         return f"{sec // 86400}d"
     if sec >= 3600:
         return f"{sec // 3600}h"
@@ -98,6 +98,16 @@ def fmt_age(sec):
 
 def fmt_time(ts):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def fmt_size(n):
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
 
 
 def short(text, n=50):
@@ -151,7 +161,21 @@ def print_table(headers, rows, colorize=None):
         print("  ".join(cells).rstrip())
 
 
-# ---------------------------------------------------------------- backends
+def print_findings(findings, columns):
+    """columns: list of (header, getter); first column must be severity."""
+    rows = [[get(f) for _, get in columns] for f in findings]
+    print_table([h for h, _ in columns], rows, colorize=lambda i, raw, s: SEV_COLOR[raw](s) if i == 0 else s)
+
+
+def severity_counts(findings):
+    return {k: sum(1 for f in findings if f.severity == k) for k in SEVERITY_RANK}
+
+
+def exit_code(counts, fail_on):
+    if fail_on == "never":
+        return 0
+    return 1 if counts["ERROR"] or (fail_on == "warn" and counts["WARN"]) else 0
+
 
 class PveshBackend:
     """Local node: pvesh proxies calls to other cluster nodes itself."""
@@ -161,19 +185,22 @@ class PveshBackend:
     def __init__(self, binary="pvesh"):
         self.binary = binary
 
+    def seg(self, text):
+        return text
+
     def _run(self, method, path, params):
         cmd = [self.binary, method, path, "--output-format", "json"]
         for k, v in params.items():
             cmd += ["--" + k, str(v)]
         try:
-            # own session: Ctrl-C must not kill a running pvesh worker mid-delete
+            # own session: Ctrl-C must not kill a running pvesh worker mid-task
             p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True, start_new_session=True)
         except OSError as e:
-            raise PvesnapError(f"cannot run {self.binary}: {e}") from e
+            raise PveError(f"cannot run {self.binary}: {e}") from e
         if p.returncode != 0:
             msg = " | ".join(l.strip() for l in (p.stderr or p.stdout).strip().splitlines() if l.strip())
-            raise PvesnapError(f"pvesh {method} {path}: {msg or 'exit code ' + str(p.returncode)}")
+            raise PveError(f"pvesh {method} {path}: {msg or 'exit code ' + str(p.returncode)}")
         return p.stdout
 
     def get(self, path, **params):
@@ -183,10 +210,14 @@ class PveshBackend:
         try:
             return json.loads(out)
         except ValueError as e:
-            raise PvesnapError(f"pvesh get {path}: invalid JSON: {e}") from e
+            raise PveError(f"pvesh get {path}: invalid JSON: {e}") from e
 
     def delete(self, path, **params):
         m = UPID_RE.search(self._run("delete", path, params))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(self._run("set", path, params))
         return m.group(0) if m else None
 
 
@@ -208,39 +239,161 @@ class ApiBackend:
         self.headers = {"Authorization": "PVEAPIToken=" + token, "Accept": "application/json"}
         self.ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
 
+    def seg(self, text):
+        """Encode one path segment that may contain '/' (volume ids)."""
+        return urllib.parse.quote(text, safe=":")
+
     def _req(self, method, path, params):
-        url = self.base + urllib.parse.quote(path, safe="/")
+        url = self.base + urllib.parse.quote(path, safe="/%:")
+        data, headers = None, dict(self.headers)
         q = urllib.parse.urlencode(params)
-        if q:
+        if method in ("PUT", "POST"):
+            data = q.encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif q:
             url += "?" + q
-        req = urllib.request.Request(url, method=method, headers=self.headers)
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
             with urllib.request.urlopen(req, context=self.ctx, timeout=120) as r:
                 return json.load(r).get("data")
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "replace").strip()
-            raise PvesnapError(f"{method} {path}: HTTP {e.code} {e.reason} {body}".strip()) from e
+            raise PveError(f"{method} {path}: HTTP {e.code} {e.reason} {body}".strip()) from e
         except (urllib.error.URLError, OSError, ValueError) as e:
-            raise PvesnapError(f"{method} {path}: {e}") from e
+            raise PveError(f"{method} {path}: {e}") from e
 
     def get(self, path, **params):
         return self._req("GET", path, params)
 
     def delete(self, path, **params):
-        data = self._req("DELETE", path, params)
-        m = UPID_RE.search(str(data or ""))
+        m = UPID_RE.search(str(self._req("DELETE", path, params) or ""))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(str(self._req("PUT", path, params) or ""))
         return m.group(0) if m else None
 
 
 def make_backend(args):
     if args.api_url:
         if not args.token:
-            raise PvesnapError("--api-url needs --token or PVESNAP_TOKEN")
+            raise PveError("--api-url needs --token or PVE_TOKEN")
         return ApiBackend(args.api_url, args.token, verify=not args.insecure)
     if shutil.which(args.pvesh) or os.path.isfile(args.pvesh):
         return PveshBackend(args.pvesh)
-    raise PvesnapError("pvesh not found: run on a Proxmox VE node or set "
-                       "--api-url/--token (env PVESNAP_API_URL, PVESNAP_TOKEN)")
+    raise PveError("pvesh not found: run on a Proxmox VE node or set --api-url/--token (env PVE_API_URL, PVE_TOKEN)")
+
+
+def wait_task(backend, upid, timeout):
+    """Polls a task until it stops; returns '' or ' [WARNINGS: n]', raises on failure."""
+    node = upid.split(":")[1]
+    path = f"/nodes/{node}/tasks/{upid}"
+    deadline = time.monotonic() + timeout
+    delay = 0.5
+    while True:
+        st = backend.get(path + "/status") or {}
+        if st.get("status") == "stopped":
+            break
+        if time.monotonic() > deadline:
+            raise PveError(f"task still running after {timeout}s, guest/volume stays locked until it ends: {upid}")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5)
+    es = str(st.get("exitstatus", ""))
+    if es == "OK":
+        return ""
+    if es.startswith("WARNINGS"):
+        return f" [{es}]"
+    tail = ""
+    try:
+        log = backend.get(path + "/log", limit=1000) or []
+        lines = [str(e.get("t", "")) for e in log if e.get("t")][-5:]
+        tail = (" | " + " | ".join(lines)) if lines else ""
+    except PveError:
+        pass
+    raise PveError(f"task failed: {es}{tail}")
+
+
+class Stopper:
+    """SIGINT: first press stops after the running operation, second aborts."""
+
+    def __init__(self):
+        self.stop = False
+        self.old = None
+
+    def __call__(self, signum, frame):
+        if self.stop:
+            raise KeyboardInterrupt
+        self.stop = True
+        print("\nstopping after the running operation(s), Ctrl-C again aborts", file=sys.stderr, flush=True)
+
+    def __enter__(self):
+        self.old = signal.signal(signal.SIGINT, self)
+        return self
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self.old)
+        return False
+
+
+def confirm(args):
+    """True if execution may proceed (--yes or interactive y)."""
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        raise PveError("stdin is not a terminal: pass --yes to confirm")
+    return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def common_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    conn = common.add_argument_group("connection (default: local pvesh)")
+    conn.add_argument("--api-url", default=os.environ.get("PVE_API_URL"),
+                      help="remote API, e.g. https://pve1:8006 (env PVE_API_URL)")
+    conn.add_argument("--token", default=os.environ.get("PVE_TOKEN"),
+                      help="API token USER@REALM!ID=SECRET (env PVE_TOKEN)")
+    conn.add_argument("--insecure", action="store_true",
+                      default=os.environ.get("PVE_INSECURE", "") not in ("", "0"),
+                      help="skip TLS verification (env PVE_INSECURE=1)")
+    conn.add_argument("--pvesh", default="pvesh", help="pvesh binary (default: pvesh)")
+    common.add_argument("-j", "--jobs", type=positive_int, default=8, help="parallel API reads (default 8)")
+    common.add_argument("--no-color", action="store_true", help="no ANSI colors (also env NO_COLOR)")
+    return common
+
+
+def filter_parser():
+    filt = argparse.ArgumentParser(add_help=False)
+    fg = filt.add_argument_group("guest filters")
+    fg.add_argument("--node", action="append", help="only this node (repeatable)")
+    fg.add_argument("--type", choices=["qemu", "lxc"], help="only VMs or containers")
+    fg.add_argument("--name", type=regex, help="regex on guest name")
+    return filt
+
+
+def guest_filtered(args, vmid, node, gtype, name):
+    """True if the guest passes GUESTS/--node/--type/--name."""
+    if getattr(args, "guests", None) is not None and vmid not in args.guests:
+        return False
+    if args.node and node not in args.node:
+        return False
+    if args.type and gtype != args.type:
+        return False
+    return not (args.name and not args.name.search(name or ""))
+
+
+def run_main(parser, commands, readonly, prog, argv=None):
+    args = parser.parse_args(argv)
+    C.on = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    if args.cmd in readonly and hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        return commands[args.cmd](make_backend(args), args)
+    except PveError as e:
+        print(f"{prog}: error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+# ==== shared:end
 
 
 # ---------------------------------------------------------------- model
@@ -350,13 +503,7 @@ def load_guests(backend, args):
         if vmid is None:
             continue
         all_vmids.add(vmid)
-        if args.guests is not None and vmid not in args.guests:
-            continue
-        if args.node and r.get("node") not in args.node:
-            continue
-        if args.type and r["type"] != args.type:
-            continue
-        if args.name and not args.name.search(r.get("name") or ""):
+        if not guest_filtered(args, vmid, r.get("node"), r["type"], r.get("name")):
             continue
         guests.append(Guest(vmid=vmid, node=r.get("node") or "", type=r["type"], name=r.get("name") or "",
                             status=r.get("status") or "", lock=r.get("lock") or None,
@@ -366,7 +513,7 @@ def load_guests(backend, args):
     def fetch(g):
         try:
             build_tree(g, backend.get(g.path + "/snapshot") or [])
-        except PvesnapError as e:
+        except PveError as e:
             g.error = str(e)
 
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
@@ -537,7 +684,7 @@ def parse_lvs(text):
 def _capture(cmd):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     if p.returncode != 0:
-        raise PvesnapError(f"{' '.join(cmd)}: {p.stderr.strip()}")
+        raise PveError(f"{' '.join(cmd)}: {p.stderr.strip()}")
     return p.stdout
 
 
@@ -552,14 +699,14 @@ def scan_storage():
     for cmd, parser in scans:
         try:
             items += parser(_capture(cmd))
-        except (PvesnapError, OSError) as e:
+        except (PveError, OSError) as e:
             errors.append(str(e))
     return items, errors, bool(scans)
 
 
 def check_orphans(backend, guests, all_vmids, args, scanner=scan_storage):
     if not backend.local:
-        raise PvesnapError("--orphans scans local zfs/lvm and needs the pvesh backend (run it on the node)")
+        raise PveError("--orphans scans local zfs/lvm and needs the pvesh backend (run it on the node)")
     items, errors, scanned = scanner()
     out = [Finding("INFO", None, "", "orphans", e) for e in errors]
     if not scanned:
@@ -630,7 +777,7 @@ def cmd_check(backend, args):
     now = time.time()
     try:
         tasks = backend.get("/cluster/tasks") or []
-    except PvesnapError:
+    except PveError:
         tasks = []
     findings = run_checks(guests, args, now, tasks)
     if args.orphans:
@@ -638,7 +785,7 @@ def cmd_check(backend, args):
     if args.quiet:
         findings = [f for f in findings if f.severity != "INFO"]
     findings.sort(key=lambda f: (SEVERITY_RANK[f.severity], f.vmid or 0, f.check))
-    counts = {k: sum(1 for f in findings if f.severity == k) for k in SEVERITY_RANK}
+    counts = severity_counts(findings)
     total = sum(len(g.snaps) for g in guests)
     if args.json:
         print(json.dumps({
@@ -647,18 +794,14 @@ def cmd_check(backend, args):
         }, indent=2))
     else:
         if findings:
-            rows = [[f.severity, f.vmid if f.vmid is not None else "-", f.name or "-", f.check, f.detail]
-                    for f in findings]
-            print_table(["SEV", "VMID", "NAME", "CHECK", "DETAIL"], rows,
-                        colorize=lambda i, raw, s: SEV_COLOR[raw](s) if i == 0 else s)
+            print_findings(findings, [("SEV", lambda f: f.severity),
+                                      ("VMID", lambda f: f.vmid if f.vmid is not None else "-"),
+                                      ("NAME", lambda f: f.name or "-"), ("CHECK", lambda f: f.check),
+                                      ("DETAIL", lambda f: f.detail)])
             print()
         print(f"{len(guests)} guest(s), {total} snapshot(s): {counts['ERROR']} error, {counts['WARN']} warn, "
               f"{counts['INFO']} info")
-    if args.fail_on == "never":
-        return 0
-    if counts["ERROR"] or (args.fail_on == "warn" and counts["WARN"]):
-        return 1
-    return 0
+    return exit_code(counts, args.fail_on)
 
 
 # ---------------------------------------------------------------- delete
@@ -694,65 +837,25 @@ def select_snapshots(g, args, now):
     return order, missing
 
 
-def wait_task(backend, upid, timeout):
-    node = upid.split(":")[1]
-    path = f"/nodes/{node}/tasks/{upid}"
-    deadline = time.monotonic() + timeout
-    delay = 0.5
-    while True:
-        st = backend.get(path + "/status") or {}
-        if st.get("status") == "stopped":
-            break
-        if time.monotonic() > deadline:
-            raise PvesnapError(f"task still running after {timeout}s, guest stays locked until it ends: {upid}")
-        time.sleep(delay)
-        delay = min(delay * 1.5, 5)
-    es = str(st.get("exitstatus", ""))
-    if es == "OK":
-        return ""
-    if es.startswith("WARNINGS"):
-        return f" [{es}]"
-    tail = ""
-    try:
-        log = backend.get(path + "/log", limit=1000) or []
-        lines = [str(e.get("t", "")) for e in log if e.get("t")][-5:]
-        tail = (" | " + " | ".join(lines)) if lines else ""
-    except PvesnapError:
-        pass
-    raise PvesnapError(f"task failed: {es}{tail}")
-
-
 def delete_snapshot(backend, g, name, force, timeout):
     params = {"force": 1} if force else {}
     upid = backend.delete(f"{g.path}/snapshot/{name}", **params)
     return wait_task(backend, upid, timeout) if upid else ""
 
 
-class Stopper:
-    def __init__(self):
-        self.stop = False
-
-    def __call__(self, signum, frame):
-        if self.stop:
-            raise KeyboardInterrupt
-        self.stop = True
-        print("\nstopping after the running deletion(s), Ctrl-C again aborts", file=sys.stderr, flush=True)
-
-
 def execute_plan(backend, plan, args):
     out_lock = threading.Lock()
-    stopper = Stopper()
 
     def log(g, msg):
         with out_lock:
             print(f"[{g.vmid}] {msg}", flush=True)
 
-    def work(item):
+    def work(item, stopper):
         g, names = item
         done = []
         try:
             st = backend.get(g.path + "/status/current") or {}
-        except PvesnapError as e:
+        except PveError as e:
             log(g, C.red(f"SKIP guest: {e}"))
             return 0, 0, len(names)
         if st.get("lock"):
@@ -766,7 +869,7 @@ def execute_plan(backend, plan, args):
             log(g, f"({i}/{len(names)}) deleting '{n}' ...")
             try:
                 warn = delete_snapshot(backend, g, n, args.force, args.timeout)
-            except PvesnapError as e:
+            except PveError as e:
                 log(g, C.red(f"FAILED '{n}': {e}"))
                 if len(names) - i:
                     log(g, f"skipping remaining {len(names) - i} snapshot(s) of this guest")
@@ -775,7 +878,7 @@ def execute_plan(backend, plan, args):
             log(g, C.green(f"deleted '{n}'") + f" ({time.monotonic() - t0:.0f}s){warn}")
         try:
             left = set(done) & {e.get("name") for e in backend.get(g.path + "/snapshot") or []}
-        except PvesnapError as e:
+        except PveError as e:
             log(g, C.yellow(f"verify failed: {e}"))
             left = set()
         if left:
@@ -783,15 +886,12 @@ def execute_plan(backend, plan, args):
             return len(done) - len(left), len(left), 0
         return len(done), 0, 0
 
-    old = signal.signal(signal.SIGINT, stopper)
-    try:
+    with Stopper() as stopper:
         if args.parallel > 1:
             with ThreadPoolExecutor(max_workers=args.parallel) as ex:
-                results = list(ex.map(work, plan))
+                results = list(ex.map(lambda item: work(item, stopper), plan))
         else:
-            results = [work(item) for item in plan]
-    finally:
-        signal.signal(signal.SIGINT, old)
+            results = [work(item, stopper) for item in plan]
     ok, failed, skipped = (sum(r[i] for r in results) for i in range(3))
     print(f"\ndeleted {ok}, failed {failed}, skipped {skipped}")
     return 0 if not failed and not skipped else 1
@@ -799,12 +899,12 @@ def execute_plan(backend, plan, args):
 
 def cmd_delete(backend, args):
     if not has_selector(args):
-        raise PvesnapError("nothing selected: name snapshots or use --subtree/--upto/--all/--older-than/"
-                           "--match/--keep-last")
+        raise PveError("nothing selected: name snapshots or use --subtree/--upto/--all/--older-than/"
+                       "--match/--keep-last")
     guests, _ = load_guests(backend, args)
     strict = args.guests is not None and len(args.guests) == 1
     if strict and not guests:
-        raise PvesnapError(f"guest {next(iter(args.guests))} not found (or filtered out)")
+        raise PveError(f"guest {next(iter(args.guests))} not found (or filtered out)")
     now = time.time()
     plan, errors = [], 0
     for g in guests:
@@ -814,7 +914,7 @@ def cmd_delete(backend, args):
             continue
         names, missing = select_snapshots(g, args, now)
         if missing and strict:
-            raise PvesnapError(f"{g.vmid}: snapshot(s) not found: {', '.join(missing)}")
+            raise PveError(f"{g.vmid}: snapshot(s) not found: {', '.join(missing)}")
         if names:
             plan.append((g, names))
     if not plan:
@@ -829,12 +929,9 @@ def cmd_delete(backend, args):
     if args.dry_run:
         print("dry run: nothing deleted")
         return 1 if errors else 0
-    if not args.yes:
-        if not sys.stdin.isatty():
-            raise PvesnapError("stdin is not a terminal: pass --yes to confirm")
-        if input("proceed? [y/N] ").strip().lower() not in ("y", "yes"):
-            print("aborted")
-            return 1
+    if not confirm(args):
+        print("aborted")
+        return 1
     rc = execute_plan(backend, plan, args)
     return 1 if errors else rc
 
@@ -842,27 +939,8 @@ def cmd_delete(backend, args):
 # ---------------------------------------------------------------- cli
 
 def build_parser():
-    common = argparse.ArgumentParser(add_help=False)
-    conn = common.add_argument_group("connection (default: local pvesh)")
-    conn.add_argument("--api-url", default=os.environ.get("PVESNAP_API_URL"),
-                      help="remote API, e.g. https://pve1:8006 (env PVESNAP_API_URL)")
-    conn.add_argument("--token", default=os.environ.get("PVESNAP_TOKEN"),
-                      help="API token USER@REALM!ID=SECRET (env PVESNAP_TOKEN)")
-    conn.add_argument("--insecure", action="store_true",
-                      default=os.environ.get("PVESNAP_INSECURE", "") not in ("", "0"),
-                      help="skip TLS verification (env PVESNAP_INSECURE=1)")
-    conn.add_argument("--pvesh", default="pvesh", help="pvesh binary (default: pvesh)")
-    common.add_argument("-j", "--jobs", type=positive_int, default=8, help="parallel API reads (default 8)")
-    common.add_argument("--no-color", action="store_true", help="no ANSI colors (also env NO_COLOR)")
-
-    filt = argparse.ArgumentParser(add_help=False)
-    fg = filt.add_argument_group("guest filters")
-    fg.add_argument("--node", action="append", help="only guests on this node (repeatable)")
-    fg.add_argument("--type", choices=["qemu", "lxc"], help="only VMs or containers")
-    fg.add_argument("--name", type=regex, help="regex on guest name")
-
+    common, filt = common_parser(), filter_parser()
     p = argparse.ArgumentParser(prog="pvesnap", description=__doc__.splitlines()[0],
-                                formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog="GUESTS: 100 | 100,101 | 200-210 | all")
     p.add_argument("--version", action="version", version=f"pvesnap {VERSION}")
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
@@ -923,19 +1001,8 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
-    C.on = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
-    if args.cmd in ("list", "check") and hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    try:
-        backend = make_backend(args)
-        return {"list": cmd_list, "check": cmd_check, "delete": cmd_delete}[args.cmd](backend, args)
-    except PvesnapError as e:
-        print(f"pvesnap: error: {e}", file=sys.stderr)
-        return 2
-    except KeyboardInterrupt:
-        print("\ninterrupted", file=sys.stderr)
-        return 130
+    return run_main(build_parser(), {"list": cmd_list, "check": cmd_check, "delete": cmd_delete},
+                    {"list", "check"}, "pvesnap", argv)
 
 
 if __name__ == "__main__":

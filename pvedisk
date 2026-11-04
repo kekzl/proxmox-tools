@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+"""pvedisk - find and safely delete orphaned Proxmox VE guest volumes, cluster-wide.
+
+Compares every images/rootdir volume on every storage with all guest configs (current,
+pending, snapshots, replication). Runs on a PVE node via pvesh, or remotely via API token.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+
+VERSION = "0.1.0"
+
+# ==== shared:begin
+UPID_RE = re.compile(r"UPID:[^\s\"']+")
+SEVERITY_RANK = {"ERROR": 0, "WARN": 1, "INFO": 2}
+AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+
+
+class PveError(Exception):
+    """Fatal or per-item error with a user-facing message."""
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_age(text):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhdwy]?)\s*", str(text))
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid age '{text}' (examples: 30d, 12h, 2w, 90m)")
+    return int(float(m.group(1)) * AGE_UNITS[m.group(2) or "d"])
+
+
+def parse_idspec(text):
+    """'all' -> None, '100,105,200-210' -> set of vmids."""
+    if text in ("all", "*"):
+        return None
+    ids = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise argparse.ArgumentTypeError(f"invalid guest spec '{part}' (examples: 100, 100,101, 200-210, all)")
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if b < a or b - a > 1000000:
+            raise argparse.ArgumentTypeError(f"invalid range '{part}'")
+        ids.update(range(a, b + 1))
+    if not ids:
+        raise argparse.ArgumentTypeError("empty guest spec")
+    return ids
+
+
+def regex(text):
+    try:
+        return re.compile(text)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"invalid regex '{text}': {e}")
+
+
+def positive_int(text):
+    v = _int(text)
+    if v is None or v < 1:
+        raise argparse.ArgumentTypeError(f"expected integer >= 1, got '{text}'")
+    return v
+
+
+def fmt_age(sec):
+    if sec is None:
+        return "?"
+    sec = max(0, int(sec))
+    if sec >= 172800:
+        return f"{sec // 86400}d"
+    if sec >= 3600:
+        return f"{sec // 3600}h"
+    return f"{sec // 60}m"
+
+
+def fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def fmt_size(n):
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def short(text, n=50):
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return line if len(line) <= n else line[: n - 3] + "..."
+
+
+class C:
+    on = False
+
+    @classmethod
+    def wrap(cls, code, s):
+        return f"\033[{code}m{s}\033[0m" if cls.on and s else s
+
+    @classmethod
+    def red(cls, s):
+        return cls.wrap("31", s)
+
+    @classmethod
+    def yellow(cls, s):
+        return cls.wrap("33", s)
+
+    @classmethod
+    def green(cls, s):
+        return cls.wrap("32", s)
+
+    @classmethod
+    def dim(cls, s):
+        return cls.wrap("2", s)
+
+    @classmethod
+    def bold(cls, s):
+        return cls.wrap("1", s)
+
+
+SEV_COLOR = {"ERROR": C.red, "WARN": C.yellow, "INFO": C.dim}
+
+
+def print_table(headers, rows, colorize=None):
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    last = len(headers) - 1
+    print("  ".join(h if i == last else h.ljust(widths[i]) for i, h in enumerate(headers)))
+    for r in rows:
+        cells = []
+        for i, cell in enumerate(r):
+            s = str(cell) if i == last else str(cell).ljust(widths[i])
+            cells.append(colorize(i, str(cell), s) if colorize else s)
+        print("  ".join(cells).rstrip())
+
+
+def print_findings(findings, columns):
+    """columns: list of (header, getter); first column must be severity."""
+    rows = [[get(f) for _, get in columns] for f in findings]
+    print_table([h for h, _ in columns], rows, colorize=lambda i, raw, s: SEV_COLOR[raw](s) if i == 0 else s)
+
+
+def severity_counts(findings):
+    return {k: sum(1 for f in findings if f.severity == k) for k in SEVERITY_RANK}
+
+
+def exit_code(counts, fail_on):
+    if fail_on == "never":
+        return 0
+    return 1 if counts["ERROR"] or (fail_on == "warn" and counts["WARN"]) else 0
+
+
+class PveshBackend:
+    """Local node: pvesh proxies calls to other cluster nodes itself."""
+
+    local = True
+
+    def __init__(self, binary="pvesh"):
+        self.binary = binary
+
+    def seg(self, text):
+        return text
+
+    def _run(self, method, path, params):
+        cmd = [self.binary, method, path, "--output-format", "json"]
+        for k, v in params.items():
+            cmd += ["--" + k, str(v)]
+        try:
+            # own session: Ctrl-C must not kill a running pvesh worker mid-task
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, start_new_session=True)
+        except OSError as e:
+            raise PveError(f"cannot run {self.binary}: {e}") from e
+        if p.returncode != 0:
+            msg = " | ".join(l.strip() for l in (p.stderr or p.stdout).strip().splitlines() if l.strip())
+            raise PveError(f"pvesh {method} {path}: {msg or 'exit code ' + str(p.returncode)}")
+        return p.stdout
+
+    def get(self, path, **params):
+        out = self._run("get", path, params).strip()
+        if not out:
+            return None
+        try:
+            return json.loads(out)
+        except ValueError as e:
+            raise PveError(f"pvesh get {path}: invalid JSON: {e}") from e
+
+    def delete(self, path, **params):
+        m = UPID_RE.search(self._run("delete", path, params))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(self._run("set", path, params))
+        return m.group(0) if m else None
+
+
+class ApiBackend:
+    """Remote: https://host:8006 with an API token (USER@REALM!ID=SECRET)."""
+
+    local = False
+
+    def __init__(self, url, token, verify=True):
+        if "://" not in url:
+            url = "https://" + url
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.port:
+            url = f"{parsed.scheme}://{parsed.hostname}:8006"
+        self.base = url.rstrip("/") + "/api2/json"
+        token = token.strip()
+        if token.startswith("PVEAPIToken="):
+            token = token[len("PVEAPIToken="):]
+        self.headers = {"Authorization": "PVEAPIToken=" + token, "Accept": "application/json"}
+        self.ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
+
+    def seg(self, text):
+        """Encode one path segment that may contain '/' (volume ids)."""
+        return urllib.parse.quote(text, safe=":")
+
+    def _req(self, method, path, params):
+        url = self.base + urllib.parse.quote(path, safe="/%:")
+        data, headers = None, dict(self.headers)
+        q = urllib.parse.urlencode(params)
+        if method in ("PUT", "POST"):
+            data = q.encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif q:
+            url += "?" + q
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=120) as r:
+                return json.load(r).get("data")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace").strip()
+            raise PveError(f"{method} {path}: HTTP {e.code} {e.reason} {body}".strip()) from e
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise PveError(f"{method} {path}: {e}") from e
+
+    def get(self, path, **params):
+        return self._req("GET", path, params)
+
+    def delete(self, path, **params):
+        m = UPID_RE.search(str(self._req("DELETE", path, params) or ""))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(str(self._req("PUT", path, params) or ""))
+        return m.group(0) if m else None
+
+
+def make_backend(args):
+    if args.api_url:
+        if not args.token:
+            raise PveError("--api-url needs --token or PVE_TOKEN")
+        return ApiBackend(args.api_url, args.token, verify=not args.insecure)
+    if shutil.which(args.pvesh) or os.path.isfile(args.pvesh):
+        return PveshBackend(args.pvesh)
+    raise PveError("pvesh not found: run on a Proxmox VE node or set --api-url/--token (env PVE_API_URL, PVE_TOKEN)")
+
+
+def wait_task(backend, upid, timeout):
+    """Polls a task until it stops; returns '' or ' [WARNINGS: n]', raises on failure."""
+    node = upid.split(":")[1]
+    path = f"/nodes/{node}/tasks/{upid}"
+    deadline = time.monotonic() + timeout
+    delay = 0.5
+    while True:
+        st = backend.get(path + "/status") or {}
+        if st.get("status") == "stopped":
+            break
+        if time.monotonic() > deadline:
+            raise PveError(f"task still running after {timeout}s, guest/volume stays locked until it ends: {upid}")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5)
+    es = str(st.get("exitstatus", ""))
+    if es == "OK":
+        return ""
+    if es.startswith("WARNINGS"):
+        return f" [{es}]"
+    tail = ""
+    try:
+        log = backend.get(path + "/log", limit=1000) or []
+        lines = [str(e.get("t", "")) for e in log if e.get("t")][-5:]
+        tail = (" | " + " | ".join(lines)) if lines else ""
+    except PveError:
+        pass
+    raise PveError(f"task failed: {es}{tail}")
+
+
+class Stopper:
+    """SIGINT: first press stops after the running operation, second aborts."""
+
+    def __init__(self):
+        self.stop = False
+        self.old = None
+
+    def __call__(self, signum, frame):
+        if self.stop:
+            raise KeyboardInterrupt
+        self.stop = True
+        print("\nstopping after the running operation(s), Ctrl-C again aborts", file=sys.stderr, flush=True)
+
+    def __enter__(self):
+        self.old = signal.signal(signal.SIGINT, self)
+        return self
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self.old)
+        return False
+
+
+def confirm(args):
+    """True if execution may proceed (--yes or interactive y)."""
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        raise PveError("stdin is not a terminal: pass --yes to confirm")
+    return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def common_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    conn = common.add_argument_group("connection (default: local pvesh)")
+    conn.add_argument("--api-url", default=os.environ.get("PVE_API_URL"),
+                      help="remote API, e.g. https://pve1:8006 (env PVE_API_URL)")
+    conn.add_argument("--token", default=os.environ.get("PVE_TOKEN"),
+                      help="API token USER@REALM!ID=SECRET (env PVE_TOKEN)")
+    conn.add_argument("--insecure", action="store_true",
+                      default=os.environ.get("PVE_INSECURE", "") not in ("", "0"),
+                      help="skip TLS verification (env PVE_INSECURE=1)")
+    conn.add_argument("--pvesh", default="pvesh", help="pvesh binary (default: pvesh)")
+    common.add_argument("-j", "--jobs", type=positive_int, default=8, help="parallel API reads (default 8)")
+    common.add_argument("--no-color", action="store_true", help="no ANSI colors (also env NO_COLOR)")
+    return common
+
+
+def filter_parser():
+    filt = argparse.ArgumentParser(add_help=False)
+    fg = filt.add_argument_group("guest filters")
+    fg.add_argument("--node", action="append", help="only this node (repeatable)")
+    fg.add_argument("--type", choices=["qemu", "lxc"], help="only VMs or containers")
+    fg.add_argument("--name", type=regex, help="regex on guest name")
+    return filt
+
+
+def guest_filtered(args, vmid, node, gtype, name):
+    """True if the guest passes GUESTS/--node/--type/--name."""
+    if getattr(args, "guests", None) is not None and vmid not in args.guests:
+        return False
+    if args.node and node not in args.node:
+        return False
+    if args.type and gtype != args.type:
+        return False
+    return not (args.name and not args.name.search(name or ""))
+
+
+def run_main(parser, commands, readonly, prog, argv=None):
+    args = parser.parse_args(argv)
+    C.on = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    if args.cmd in readonly and hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        return commands[args.cmd](make_backend(args), args)
+    except PveError as e:
+        print(f"{prog}: error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+# ==== shared:end
+
+
+DISKNAME_RE = re.compile(r"(?:^|/)(?:vm|base|subvol|basevol)-\d+-(?:disk-\d+|cloudinit|state-[^/]+)(?:\.\w+)?$")
+STATE_VOL_RE = re.compile(r"(?:^|/)vm-\d+-state-[^/]+$")
+LINKED_RE = re.compile(r"^((?:\d+/)?base-\d+-disk-\d+(?:\.\w+)?)/(.+)$")
+STORAGE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9\-_.]*$")
+SKIP_KEYS = {"description", "digest", "parent", "snaptime", "snapstate", "delete", "tags", "lock", "name",
+             "hostname", "meta", "smbios1", "vmgenid", "net0", "boot"}
+DELETABLE = ("orphan", "stale", "unused")
+KIND_ORDER = {"missing": 0, "orphan": 1, "stale": 2, "scan": 3, "config": 4, "unused": 5, "snapshot-only": 6,
+              "busy": 7}
+
+
+# ---------------------------------------------------------------- config parsing
+
+def norm_vol(volname):
+    """Linked clone 'base-200-disk-0/vm-100-disk-0' -> 'vm-100-disk-0'."""
+    m = LINKED_RE.match(volname)
+    return m.group(2) if m else volname
+
+
+def vol_keys(storage, volname):
+    m = LINKED_RE.match(volname)
+    if m:
+        return [(storage, m.group(2)), (storage, m.group(1))]
+    return [(storage, volname)]
+
+
+def value_volids(value, storage_ids):
+    """'local-lvm:vm-100-disk-0,size=32G' -> [('local-lvm', 'vm-100-disk-0')]."""
+    out = []
+    for part in str(value).split(","):
+        k, eq, v = part.partition("=")
+        cand = v if eq and k.strip() in ("file", "volume") else (None if eq else part)
+        if not cand or ":" not in cand:
+            continue
+        st, _, vol = cand.strip().partition(":")
+        if vol and STORAGE_ID_RE.match(st) and st in storage_ids:
+            out.append((st, vol))
+    return out
+
+
+def parse_conf(text):
+    """PVE guest .conf -> {section: {key: value}}; '' = current, 'PENDING', snapshot names."""
+    sections, cur = {"": {}}, ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.fullmatch(r"\[([^\]]+)\]", line)
+        if m:
+            cur = m.group(1)
+            sections.setdefault(cur, {})
+            continue
+        k, sep, v = line.partition(":")
+        if sep:
+            sections[cur][k.strip()] = v.strip()
+    return sections
+
+
+@dataclass
+class GuestCfg:
+    vmid: int
+    node: str
+    type: str
+    name: str = ""
+    lock: str | None = None
+    refs: dict = field(default_factory=dict)      # (storage, vol) -> {config, pending, snapshot, unused}
+    keys: dict = field(default_factory=dict)      # (storage, vol) -> current config keys
+    unused: dict = field(default_factory=dict)    # (storage, vol) -> unusedN
+    error: str | None = None
+
+    @property
+    def path(self):
+        return f"/nodes/{self.node}/{self.type}/{self.vmid}"
+
+
+def apply_refs(g, sections, storage_ids):
+    for sec, kv in sections.items():
+        base_where = "config" if sec == "" else "pending" if sec == "PENDING" else "snapshot"
+        for k, v in kv.items():
+            if k in SKIP_KEYS:
+                continue
+            for st, vol in value_volids(v, storage_ids):
+                where = "unused" if sec == "" and k.startswith("unused") else base_where
+                for key in vol_keys(st, vol):
+                    g.refs.setdefault(key, set()).add(where)
+                    if sec == "":
+                        g.keys.setdefault(key, set()).add(k)
+                    if where == "unused":
+                        g.unused[key] = k
+
+
+def read_conf_file(root, g):
+    sub = "qemu-server" if g.type == "qemu" else "lxc"
+    with open(os.path.join(root, "nodes", g.node, sub, f"{g.vmid}.conf"), encoding="utf-8", errors="replace") as f:
+        return parse_conf(f.read())
+
+
+def read_conf_api(backend, g):
+    cfg = backend.get(g.path + "/config") or {}
+    sections = {"": {k: str(v) for k, v in cfg.items()}}
+    try:
+        pend = backend.get(g.path + "/pending") or []
+        sections["PENDING"] = {}
+        for e in pend:
+            for field_name in ("value", "pending"):
+                if field_name in e:
+                    sections["PENDING"][f"{e.get('key')}#{field_name}"] = str(e[field_name])
+    except PveError:
+        pass
+    for s in backend.get(g.path + "/snapshot") or []:
+        name = s.get("name")
+        if name and name != "current":
+            snap_cfg = backend.get(f"{g.path}/snapshot/{name}/config") or {}
+            sections[name] = {k: str(v) for k, v in snap_cfg.items()}
+    return sections
+
+
+def load_configs(backend, guests, storage_ids, args):
+    mode = args.config_source
+    files_ok = os.path.isdir(os.path.join(args.pve_dir, "nodes"))
+    if mode == "auto":
+        mode = "files" if backend.local and files_ok else "api"
+    if mode == "files" and not files_ok:
+        raise PveError(f"--config-source files: {args.pve_dir}/nodes not found")
+
+    def fetch(g):
+        try:
+            sections = read_conf_file(args.pve_dir, g) if mode == "files" else read_conf_api(backend, g)
+            apply_refs(g, sections, storage_ids)
+        except (PveError, OSError, ValueError) as e:
+            g.error = str(e)
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        list(ex.map(fetch, guests))
+    return mode
+
+
+# ---------------------------------------------------------------- scan
+
+@dataclass
+class Finding:
+    severity: str
+    kind: str
+    node: str
+    storage: str
+    volid: str
+    vmid: int | None
+    size: int | None
+    detail: str
+    shared: bool = False
+    unused_key: str | None = None
+    guest_node: str | None = None
+    guest_type: str | None = None
+
+    def ident(self):
+        return (self.kind, "*" if self.shared else self.node, self.volid, self.vmid, self.unused_key)
+
+
+def list_volumes(backend, node, storage):
+    out = []
+    for e in backend.get(f"/nodes/{node}/storage/{storage}/content") or []:
+        if e.get("content") in ("images", "rootdir") and ":" in str(e.get("volid") or ""):
+            out.append(e)
+    return out
+
+
+def scan(backend, args):
+    """Returns (findings, info dict). Config refs come from all guests, filters apply to findings only."""
+    res = backend.get("/cluster/resources") or []
+    guests, storages = {}, {}
+    for r in res:
+        t = r.get("type")
+        if t in ("qemu", "lxc"):
+            vmid = _int(r.get("vmid"))
+            if vmid is not None:
+                guests[vmid] = GuestCfg(vmid, r.get("node") or "", t, r.get("name") or "", r.get("lock") or None)
+        elif t == "storage" and r.get("storage") and r.get("node"):
+            storages[(r["node"], r["storage"])] = r
+    storage_ids = {s for _, s in storages}
+    shared_ids = {s for (_, s), r in storages.items() if _int(r.get("shared"))}
+    findings = []
+    mode = load_configs(backend, list(guests.values()), storage_ids, args)
+
+    busy = {g.vmid: f"locked '{g.lock}'" for g in guests.values() if g.lock}
+    try:
+        for t in backend.get("/cluster/tasks") or []:
+            vmid = _int(t.get("id"))
+            if vmid is not None and not t.get("endtime"):
+                busy[vmid] = f"task {t.get('type')} running"
+    except PveError as e:
+        raise PveError(f"cannot read running tasks, refusing to classify volumes: {e}") from e
+    replicas = set()
+    try:
+        for j in backend.get("/cluster/replication") or []:
+            replicas.add((_int(j.get("guest")), j.get("target")))
+    except PveError:
+        pass
+
+    targets, shared_node, shared_wanted = [], {}, set()
+    for (node, st), r in sorted(storages.items()):
+        if not set(str(r.get("content") or "").split(",")) & {"images", "rootdir"}:
+            continue
+        if args.storage and st not in args.storage:
+            continue
+        shared = st in shared_ids
+        if not shared and args.node and node not in args.node:
+            continue
+        if shared:
+            shared_wanted.add(st)
+        if r.get("status") != "available":
+            if not shared:
+                findings.append(Finding("INFO", "scan", node, st, "", None, None,
+                                        f"storage status '{r.get('status')}', not scanned"))
+            continue
+        if shared:
+            if st in shared_node:
+                continue
+            shared_node[st] = node
+        targets.append((node, st, shared))
+    for st in sorted(shared_wanted - set(shared_node)):
+        findings.append(Finding("INFO", "scan", "", st, "", None, None, "shared storage not available on any node",
+                                shared=True))
+
+    def fetch(t):
+        node, st, shared = t
+        try:
+            return t, list_volumes(backend, node, st), None
+        except PveError as e:
+            return t, [], str(e)
+
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        listed = list(ex.map(fetch, targets))
+
+    refidx = {}
+    for g in guests.values():
+        if g.error:
+            continue
+        for (st, vol), wheres in g.refs.items():
+            local = st not in shared_ids
+            refidx.setdefault(("*" if not local else g.node, st, vol), []).append((g.vmid, set(wheres)))
+            if local:
+                for gv, target in replicas:
+                    if gv == g.vmid and target and target != g.node:
+                        refidx.setdefault((target, st, vol), []).append((g.vmid, {"replica"}))
+
+    unreadable = set()
+    for g in guests.values():
+        if g.error:
+            unreadable.add(g.vmid)
+            findings.append(Finding("WARN", "config", g.node, "", "", g.vmid, None,
+                                    f"config unreadable, volumes of {g.vmid} not classified: {g.error}"))
+
+    present, listed_scopes = set(), set()
+    for (node, st, shared), vols, err in listed:
+        if err:
+            findings.append(Finding("WARN", "scan", node, st, "", None, None, f"cannot list: {err}", shared=shared))
+            continue
+        scope = "*" if shared else node
+        listed_scopes.add((scope, st))
+        for e in vols:
+            volid = e["volid"]
+            norm = norm_vol(volid.split(":", 1)[1])
+            present.add((scope, st, norm))
+            vmid, size = _int(e.get("vmid")), _int(e.get("size"))
+
+            def add(sev, kind, detail, **kw):
+                findings.append(Finding(sev, kind, node, st, volid, kw.pop("owner", vmid), size, detail,
+                                        shared, **kw))
+
+            hits = refidx.get((scope, st, norm))
+            if hits:
+                wheres = set().union(*(w for _, w in hits))
+                if wheres == {"unused"} and len(hits) == 1:
+                    owner = guests[hits[0][0]]
+                    key = owner.unused.get((st, norm))
+                    add("INFO", "unused", f"detached disk {key} of {owner.vmid}", owner=owner.vmid, unused_key=key,
+                        guest_node=owner.node, guest_type=owner.type)
+                elif wheres == {"snapshot"} and not STATE_VOL_RE.search(norm):
+                    add("INFO", "snapshot-only",
+                        "only referenced by snapshots of " + ", ".join(sorted({str(v) for v, _ in hits})))
+                continue
+            if vmid is None or vmid in unreadable:
+                continue
+            if vmid in busy:
+                add("INFO", "busy", f"not referenced, guest {vmid} busy ({busy[vmid]}), skipped")
+                continue
+            g = guests.get(vmid)
+            if g is None:
+                add("WARN", "orphan", f"guest {vmid} does not exist")
+            elif shared or g.node == node:
+                add("WARN", "orphan", f"not in any config section of {vmid} {g.name}".rstrip())
+            else:
+                add("WARN", "stale", f"guest {vmid} lives on {g.node}, no replication to {node}: leftover copy, "
+                                     f"verify the storage is not really shared")
+
+    for g in guests.values():
+        if g.error:
+            continue
+        for (st, vol), wheres in sorted(g.refs.items()):
+            scope = "*" if st in shared_ids else g.node
+            if not wheres & {"config", "unused"} or (scope, st) not in listed_scopes:
+                continue
+            if not DISKNAME_RE.search(vol) or (scope, st, vol) in present:
+                continue
+            keys = ", ".join(sorted(g.keys.get((st, vol), [])))
+            sev = "ERROR" if "config" in wheres else "INFO"
+            findings.append(Finding(sev, "missing", g.node, st, f"{st}:{vol}", g.vmid, None,
+                                    f"{keys} of {g.vmid} references a volume that is not on the storage",
+                                    shared=st in shared_ids))
+
+    findings = [f for f in findings if finding_selected(f, args)]
+    findings.sort(key=lambda f: (SEVERITY_RANK[f.severity], KIND_ORDER.get(f.kind, 9), f.storage, f.volid))
+    info = {"config_source": mode, "guests": len(guests), "storages": len(listed),
+            "volumes": sum(len(v) for _, v, _ in listed)}
+    return findings, info
+
+
+def finding_selected(f, args):
+    if args.guests is not None and f.vmid not in args.guests:
+        return False
+    if args.node and not f.shared and f.node and f.node not in args.node:
+        return False
+    return not (getattr(args, "match", None) and f.volid and not args.match.search(f.volid))
+
+
+def summary_line(findings, info):
+    parts = []
+    for kind in ("orphan", "stale", "unused", "missing", "snapshot-only", "busy"):
+        sel = [f for f in findings if f.kind == kind]
+        if sel:
+            size = sum(f.size or 0 for f in sel)
+            parts.append(f"{kind} {len(sel)}" + (f" ({fmt_size(size)})" if size else ""))
+    return (f"{info['volumes']} volume(s) on {info['storages']} storage scope(s), {info['guests']} guest config(s) "
+            f"via {info['config_source']}: " + (", ".join(parts) or "nothing found"))
+
+
+FINDING_COLUMNS = [("SEV", lambda f: f.severity), ("KIND", lambda f: f.kind),
+                   ("VMID", lambda f: f.vmid if f.vmid is not None else "-"),
+                   ("NODE", lambda f: "shared" if f.shared else (f.node or "-")),
+                   ("STORAGE", lambda f: f.storage or "-"), ("VOLUME", lambda f: f.volid or "-"),
+                   ("SIZE", lambda f: fmt_size(f.size) if f.size is not None else "-"),
+                   ("DETAIL", lambda f: f.detail)]
+
+
+def cmd_check(backend, args):
+    findings, info = scan(backend, args)
+    if args.quiet:
+        findings = [f for f in findings if f.severity != "INFO"]
+    counts = severity_counts(findings)
+    if args.json:
+        print(json.dumps({"summary": {**info, **{k.lower(): v for k, v in counts.items()}},
+                          "findings": [asdict(f) for f in findings]}, indent=2))
+    else:
+        if findings:
+            print_findings(findings, FINDING_COLUMNS)
+            print()
+        print(summary_line(findings, info))
+    return exit_code(counts, args.fail_on)
+
+
+# ---------------------------------------------------------------- delete
+
+_LOCAL_NODE = []
+
+
+def local_node(backend):
+    if not _LOCAL_NODE:
+        name = None
+        try:
+            for e in backend.get("/cluster/status") or []:
+                if e.get("type") == "node" and _int(e.get("local")):
+                    name = e.get("name")
+        except PveError:
+            pass
+        _LOCAL_NODE.append(name or socket.gethostname().split(".")[0])
+    return _LOCAL_NODE[0]
+
+
+def free_volume(backend, f, args):
+    volname = f.volid.split(":", 1)[1]
+    if not backend.local or "/" not in volname:
+        upid = backend.delete(f"/nodes/{f.node}/storage/{f.storage}/content/{backend.seg(f.volid)}")
+        return wait_task(backend, upid, args.timeout) if upid else ""
+    # pvesh cannot address volids with '/', pvesm free works for shared or local-node storage
+    if not f.shared and f.node != local_node(backend):
+        raise PveError(f"path-style volume on remote node: run 'pvesm free {f.volid}' on {f.node}")
+    p = subprocess.run([args.pvesm, "free", f.volid], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       universal_newlines=True, start_new_session=True)
+    if p.returncode != 0:
+        raise PveError(f"pvesm free {f.volid}: {(p.stderr or p.stdout).strip()}")
+    return ""
+
+
+def drop_unused(backend, f, args):
+    path = f"/nodes/{f.guest_node}/{f.guest_type}/{f.vmid}/config"
+    cfg = backend.get(path) or {}
+    val = str(cfg.get(f.unused_key) or "")
+    st, vol = f.volid.split(":", 1)
+    if (st, norm_vol(vol)) not in {(s, norm_vol(v)) for s, v in value_volids(val, {st})}:
+        raise PveError(f"{f.unused_key} of {f.vmid} changed to '{val or 'nothing'}'")
+    params = {"delete": f.unused_key}
+    if cfg.get("digest"):
+        params["digest"] = cfg["digest"]
+    upid = backend.set(path, **params)
+    return wait_task(backend, upid, args.timeout) if upid else ""
+
+
+def cmd_delete(backend, args):
+    kinds = set(args.kind or ["orphan"])
+    findings, info = scan(backend, args)
+    plan = [f for f in findings if f.kind in kinds]
+    if not plan:
+        print(summary_line(findings, info))
+        print("nothing to delete")
+        return 0
+    print_findings(plan, FINDING_COLUMNS)
+    total = sum(f.size or 0 for f in plan)
+    print(f"\nplan: delete {len(plan)} volume(s), {fmt_size(total)}, kinds {','.join(sorted(kinds))}")
+    if "stale" in kinds:
+        print(C.yellow("stale: volumes on a node-local storage of a guest living elsewhere; wrong if that storage "
+                       "is shared but not flagged 'shared' in storage.cfg"))
+    if args.dry_run:
+        print("dry run: nothing deleted")
+        return 0
+    if not confirm(args):
+        print("aborted")
+        return 1
+
+    fresh, _ = scan(backend, args)
+    still = {f.ident() for f in fresh}
+    ok = failed = skipped = 0
+    done = []
+    with Stopper() as stopper:
+        for i, f in enumerate(plan, 1):
+            tag = f"({i}/{len(plan)}) {f.kind} {f.volid}"
+            if stopper.stop:
+                skipped += len(plan) - i + 1
+                print(f"stopped, {len(plan) - i + 1} volume(s) left")
+                break
+            if f.ident() not in still:
+                skipped += 1
+                print(C.yellow(f"{tag}: changed since plan, skipped"))
+                continue
+            t0 = time.monotonic()
+            print(f"{tag} ...", flush=True)
+            try:
+                warn = drop_unused(backend, f, args) if f.kind == "unused" else free_volume(backend, f, args)
+            except PveError as e:
+                failed += 1
+                print(C.red(f"{tag}: FAILED: {e}"), flush=True)
+                continue
+            ok += 1
+            done.append(f)
+            print(C.green(f"{tag}: deleted") + f" ({time.monotonic() - t0:.0f}s){warn}", flush=True)
+
+    for (node, st) in sorted({(f.node, f.storage) for f in done}):
+        try:
+            left = {e["volid"] for e in list_volumes(backend, node, st)}
+        except PveError as e:
+            print(C.yellow(f"verify {st} on {node} failed: {e}"))
+            continue
+        for f in done:
+            if (f.node, f.storage) == (node, st) and f.volid in left:
+                ok -= 1
+                failed += 1
+                hint = " (config entry removed, volume left: rerun with --kind orphan)" if f.kind == "unused" else ""
+                print(C.red(f"{f.volid}: still present after delete{hint}"))
+    print(f"\ndeleted {ok}, failed {failed}, skipped {skipped}, freed ~{fmt_size(sum(f.size or 0 for f in done))}")
+    return 0 if not failed and not skipped else 1
+
+
+# ---------------------------------------------------------------- cli
+
+def build_parser():
+    common = common_parser()
+    filt = argparse.ArgumentParser(add_help=False)
+    fg = filt.add_argument_group("filters (apply to findings, all guest configs are always read)")
+    fg.add_argument("guests", nargs="?", default="all", type=parse_idspec, metavar="GUESTS",
+                    help="volume owner vmids: 100 | 100,101 | 200-210 | all")
+    fg.add_argument("--node", action="append", help="only node-local storages of this node (repeatable)")
+    fg.add_argument("--storage", action="append", help="only this storage (repeatable)")
+    fg.add_argument("--config-source", choices=["auto", "files", "api"], default="auto",
+                    help="guest configs from /etc/pve files (fast, local backend) or API (default auto)")
+    fg.add_argument("--pve-dir", default="/etc/pve", help=argparse.SUPPRESS)
+    fg.add_argument("--pvesm", default="pvesm", help=argparse.SUPPRESS)
+
+    p = argparse.ArgumentParser(prog="pvedisk", description=__doc__.splitlines()[0])
+    p.add_argument("--version", action="version", version=f"pvedisk {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.required = True
+
+    sp = sub.add_parser("check", parents=[common, filt], help="report orphaned, stale, unused and missing volumes",
+                        description="Kinds: orphan (no config references it), stale (copy on another node's "
+                                    "local storage), unused (detached unusedN disk), missing (config references "
+                                    "absent volume), snapshot-only, busy (guest locked or task running).")
+    sp.add_argument("--fail-on", choices=["warn", "error", "never"], default="warn",
+                    help="exit 1 threshold (default warn)")
+    sp.add_argument("-q", "--quiet", action="store_true", help="hide INFO findings")
+    sp.add_argument("--json", action="store_true", help="JSON output")
+
+    sp = sub.add_parser("delete", parents=[common, filt], help="delete volumes found by check",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description="Re-scans after confirmation and deletes only findings that are unchanged.\n"
+                                    "orphan/stale: storage content delete. unused: config 'delete unusedN'.",
+                        epilog="examples:\n"
+                               "  pvedisk delete -n                       # plan for all orphans\n"
+                               "  pvedisk delete --storage local-zfs -y\n"
+                               "  pvedisk delete 100-199 --kind orphan --kind unused\n"
+                               "  pvedisk delete --kind stale --node pve2 -n")
+    sp.add_argument("--kind", action="append", choices=DELETABLE,
+                    help="kinds to delete (repeatable, default orphan)")
+    sp.add_argument("--match", type=regex, metavar="RE", help="only volids matching regex")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="show the plan only")
+    sp.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
+    sp.add_argument("--timeout", type=positive_int, default=1800, help="seconds per task (default 1800)")
+    return p
+
+
+def main(argv=None):
+    return run_main(build_parser(), {"check": cmd_check, "delete": cmd_delete}, {"check"}, "pvedisk", argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
