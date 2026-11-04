@@ -7,16 +7,80 @@ import re
 import sys
 
 
+def new_upid(st, node, kind, ident, status):
+    st["seq"] = st.get("seq", 0) + 1
+    upid = f"UPID:{node}:{st['seq']:08X}:00000000:00000000:{kind}:{ident}:root@pam:"
+    st.setdefault("task_status", {})[upid] = status
+    return upid
+
+
+def content_list(st, node, storage):
+    c = st.setdefault("content", {})
+    return c.get(f"{node}/{storage}", c.get(f"*/{storage}"))
+
+
 def handle(st, method, path, params):
-    if method == "get" and path == "/cluster/resources":
-        return st["resources"]
-    if method == "get" and path == "/cluster/tasks":
-        return st.get("tasks", [])
+    simple = {"/cluster/resources": "resources", "/cluster/tasks": "tasks", "/cluster/status": "cluster_status",
+              "/cluster/replication": "replication", "/cluster/backup": "backup_jobs",
+              "/cluster/backup-info/not-backed-up": "not_backed_up"}
+    if method == "get" and path in simple:
+        if path in st.get("errors", {}):
+            return 2, st["errors"][path]
+        return st.get(simple[path], [])
+
+    m = re.fullmatch(r"/nodes/([^/]+)/storage/([^/]+)/content", path)
+    if m and method == "get":
+        lst = content_list(st, m.group(1), m.group(2))
+        if lst is None:
+            return 2, f"storage '{m.group(2)}' does not exist on {m.group(1)}"
+        return [e for e in lst if "content" not in params or e.get("content") == params["content"]]
+    m = re.fullmatch(r"/nodes/([^/]+)/storage/([^/]+)/content/(.+)", path)
+    if m and method == "delete":
+        lst = content_list(st, m.group(1), m.group(2)) or []
+        e = next((e for e in lst if e["volid"] == m.group(3)), None)
+        if e is None:
+            return 2, f"volume {m.group(3)} does not exist"
+        fail = st.get("fail", {}).get(m.group(3))
+        if fail:
+            return new_upid(st, m.group(1), "imgdel", m.group(3), fail)
+        lst.remove(e)
+        return new_upid(st, m.group(1), "imgdel", m.group(3), "OK")
+
+    m = re.fullmatch(r"/nodes/([^/]+)/tasks", path)
+    if m and method == "get":
+        since = int(params.get("since", 0))
+        return [t for t in st.get("node_tasks", {}).get(m.group(1), []) if t.get("starttime", 0) >= since]
+
+    m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/(config|pending)", path)
+    if m:
+        cfg = st.get("configs", {}).get(m.group(3))
+        if cfg is None:
+            return 2, f"configuration file for {m.group(3)} does not exist"
+        if m.group(4) == "pending":
+            return cfg.get("pending", [])
+        if method == "get":
+            return dict(cfg["config"], digest=cfg.get("digest", "d0"))
+        if method == "set":
+            if params.get("digest") and params["digest"] != cfg.get("digest", "d0"):
+                return 2, "detected modified configuration - file changed by other user? Try again."
+            key = params["delete"]
+            vol = cfg["config"].pop(key).split(",")[0]
+            for lst in st.get("content", {}).values():
+                lst[:] = [e for e in lst if e["volid"] != vol]
+            cfg["digest"] = cfg.get("digest", "d0") + "x"
+            return None
+
+    m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/snapshot/([^/]+)/config", path)
+    if m and method == "get":
+        return st["configs"][m.group(3)]["snapshots"][m.group(4)]
     m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/snapshot", path)
     if m and method == "get":
         if m.group(3) in st.get("broken_nodes", []):
             return 2, "hostname lookup failed"
-        snaps = st["snapshots"].get(m.group(3), [])
+        if m.group(3) in st.get("snapshots", {}):
+            snaps = st["snapshots"][m.group(3)]
+        else:
+            snaps = [{"name": n} for n in st.get("configs", {}).get(m.group(3), {}).get("snapshots", {})]
         cur = st.get("current", {}).get(m.group(3))
         now = {"name": "current", "description": "You are here!"}
         if cur:
@@ -32,17 +96,13 @@ def handle(st, method, path, params):
     m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/snapshot/([^/]+)", path)
     if m and method == "delete":
         node, vmid, name = m.group(1), m.group(3), m.group(4)
-        st["seq"] = st.get("seq", 0) + 1
-        upid = f"UPID:{node}:{st['seq']:08X}:00000000:00000000:qmdelsnapshot:{vmid}:root@pam:"
-        tasks = st.setdefault("task_status", {})
         snaps = st["snapshots"].get(vmid, [])
         target = next((s for s in snaps if s["name"] == name), None)
         if target is None:
             return 2, f"snapshot '{name}' does not exist"
         fail = st.get("fail", {}).get(f"{vmid}/{name}")
         if fail and params.get("force") != "1":
-            tasks[upid] = fail
-            return upid
+            return new_upid(st, node, "qmdelsnapshot", vmid, fail)
         parent = target.get("parent")
         for s in snaps:
             if s.get("parent") == name:
@@ -53,8 +113,7 @@ def handle(st, method, path, params):
         if st.get("current", {}).get(vmid) == name:
             st["current"][vmid] = parent
         snaps.remove(target)
-        tasks[upid] = "OK"
-        return upid
+        return new_upid(st, node, "qmdelsnapshot", vmid, "OK")
     m = re.fullmatch(r"/nodes/([^/]+)/tasks/([^/]+)/(status|log)", path)
     if m and method == "get":
         es = st.get("task_status", {}).get(m.group(2))
@@ -69,6 +128,7 @@ def handle(st, method, path, params):
 def main():
     method, path, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
     params = {rest[i].lstrip("-"): rest[i + 1] for i in range(0, len(rest) - 1, 2)}
+    params.pop("output-format", None)
     with open(os.environ["FAKE_PVE_STATE"], "r+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         st = json.load(f)
