@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
 """pvebackup - audit Proxmox VE backups: job coverage, age, verification, failed jobs, storage usage.
 
 Reads backup storages (vzdump dirs, NFS/CIFS, PBS) cluster-wide. Runs on a PVE node via pvesh,

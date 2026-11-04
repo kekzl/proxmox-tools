@@ -133,3 +133,7 @@ Templates are skipped unless `--templates`.
 | `scripts/sync-shared.sh` | re-embed `lib/shared.py` after editing it (a test fails on drift) |
 | `scripts/test.sh` | tests in Docker, python 3.9 + 3.13 |
 | `tests/fake_pvesh`, `tests/fake_pvesm` | API fakes backed by a JSON state file |
+
+## License
+
+Copyright (C) 2026 Raphael Friedmann. [GNU AGPL-3.0-only](LICENSE). Commercial licensing on request.
