@@ -256,7 +256,13 @@ class EndToEnd(StateCase):
         self.assertIn("snapshot(s) not found: nope", err)
         rc, _, err = self.run_cli("delete", "999", "--all", "-y")
         self.assertEqual(rc, 2)
+        rc, _, err = self.run_cli("delete", "100,101", "pre-upgrad", "-y")
+        self.assertEqual(rc, 2)
+        self.assertIn("not found on any selected guest: pre-upgrad", err)
         self.assertEqual(self.deletes(), [])
+        rc, out, err = self.run_cli("delete", "100,101", "a", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(self.deletes(), ["a"])
 
 
 if __name__ == "__main__":
