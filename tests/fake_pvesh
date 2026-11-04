@@ -24,7 +24,8 @@ def content_list(st, node, storage):
 def handle(st, method, path, params):
     simple = {"/cluster/resources": "resources", "/cluster/tasks": "tasks", "/cluster/status": "cluster_status",
               "/cluster/replication": "replication", "/cluster/backup": "backup_jobs",
-              "/cluster/backup-info/not-backed-up": "not_backed_up", "/storage": "storage_cfg"}
+              "/cluster/backup-info/not-backed-up": "not_backed_up", "/storage": "storage_cfg",
+              "/cluster/ceph/status": "ceph_status"}
     if method == "get" and path in simple:
         if path in st.get("errors", {}):
             return 2, st["errors"][path]
@@ -124,6 +125,11 @@ def handle(st, method, path, params):
         if m.group(3) == "status":
             return {"status": "stopped", "exitstatus": es, "upid": m.group(2)}
         return [{"n": 1, "t": "fake task log"}, {"n": 2, "t": "TASK ERROR: " + es}]
+    m = re.fullmatch(r"/nodes/([^/]+)/(.+)", path)
+    if m and method == "get" and m.group(2) in st.get("node_api", {}).get(m.group(1), {}):
+        if path in st.get("errors", {}):
+            return 2, st["errors"][path]
+        return st["node_api"][m.group(1)][m.group(2)]
     return 2, f"no handler for {method} {path}"
 
 

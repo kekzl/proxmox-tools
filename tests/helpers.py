@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 FAKE_PVESH = os.path.join(HERE, "fake_pvesh")
 FAKE_PVESM = os.path.join(HERE, "fake_pvesm")
-TOOLS = ("pvesnap", "pvedisk", "pvebackup")
+TOOLS = ("pvesnap", "pvedisk", "pvebackup", "pvenode")
 
 
 def load_tool(name):
