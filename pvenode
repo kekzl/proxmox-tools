@@ -1,0 +1,708 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
+"""pvenode - audit Proxmox VE nodes: quorum, versions, pending reboot, updates, certificates, ZFS, thin pools, SMART.
+
+Reads every online node via the cluster API. Runs on a PVE node via pvesh, or remotely via API token.
+Exit 1 on findings, for cron/monitoring.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+
+VERSION = "0.1.0"
+
+# ==== shared:begin
+UPID_RE = re.compile(r"UPID:[^\s\"']+")
+SEVERITY_RANK = {"ERROR": 0, "WARN": 1, "INFO": 2}
+AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+
+
+class PveError(Exception):
+    """Fatal or per-item error with a user-facing message."""
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_age(text):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhdwy]?)\s*", str(text))
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid age '{text}' (examples: 30d, 12h, 2w, 90m)")
+    return int(float(m.group(1)) * AGE_UNITS[m.group(2) or "d"])
+
+
+def parse_idspec(text):
+    """'all' -> None, '100,105,200-210' -> set of vmids."""
+    if text in ("all", "*"):
+        return None
+    ids = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise argparse.ArgumentTypeError(f"invalid guest spec '{part}' (examples: 100, 100,101, 200-210, all)")
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if b < a or b - a > 1000000:
+            raise argparse.ArgumentTypeError(f"invalid range '{part}'")
+        ids.update(range(a, b + 1))
+    if not ids:
+        raise argparse.ArgumentTypeError("empty guest spec")
+    return ids
+
+
+def regex(text):
+    try:
+        return re.compile(text)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"invalid regex '{text}': {e}")
+
+
+def positive_int(text):
+    v = _int(text)
+    if v is None or v < 1:
+        raise argparse.ArgumentTypeError(f"expected integer >= 1, got '{text}'")
+    return v
+
+
+def fmt_age(sec):
+    if sec is None:
+        return "?"
+    sec = max(0, int(sec))
+    if sec >= 172800:
+        return f"{sec // 86400}d"
+    if sec >= 3600:
+        return f"{sec // 3600}h"
+    return f"{sec // 60}m"
+
+
+def fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def fmt_size(n):
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def short(text, n=50):
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return line if len(line) <= n else line[: n - 3] + "..."
+
+
+class C:
+    on = False
+
+    @classmethod
+    def wrap(cls, code, s):
+        return f"\033[{code}m{s}\033[0m" if cls.on and s else s
+
+    @classmethod
+    def red(cls, s):
+        return cls.wrap("31", s)
+
+    @classmethod
+    def yellow(cls, s):
+        return cls.wrap("33", s)
+
+    @classmethod
+    def green(cls, s):
+        return cls.wrap("32", s)
+
+    @classmethod
+    def dim(cls, s):
+        return cls.wrap("2", s)
+
+    @classmethod
+    def bold(cls, s):
+        return cls.wrap("1", s)
+
+
+SEV_COLOR = {"ERROR": C.red, "WARN": C.yellow, "INFO": C.dim}
+
+
+def print_table(headers, rows, colorize=None):
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    last = len(headers) - 1
+    print("  ".join(h if i == last else h.ljust(widths[i]) for i, h in enumerate(headers)))
+    for r in rows:
+        cells = []
+        for i, cell in enumerate(r):
+            s = str(cell) if i == last else str(cell).ljust(widths[i])
+            cells.append(colorize(i, str(cell), s) if colorize else s)
+        print("  ".join(cells).rstrip())
+
+
+def print_findings(findings, columns):
+    """columns: list of (header, getter); first column must be severity."""
+    rows = [[get(f) for _, get in columns] for f in findings]
+    print_table([h for h, _ in columns], rows, colorize=lambda i, raw, s: SEV_COLOR[raw](s) if i == 0 else s)
+
+
+def severity_counts(findings):
+    return {k: sum(1 for f in findings if f.severity == k) for k in SEVERITY_RANK}
+
+
+def exit_code(counts, fail_on):
+    if fail_on == "never":
+        return 0
+    return 1 if counts["ERROR"] or (fail_on == "warn" and counts["WARN"]) else 0
+
+
+class PveshBackend:
+    """Local node: pvesh proxies calls to other cluster nodes itself."""
+
+    local = True
+
+    def __init__(self, binary="pvesh"):
+        self.binary = binary
+
+    def seg(self, text):
+        return text
+
+    def _run(self, method, path, params):
+        cmd = [self.binary, method, path, "--output-format", "json"]
+        for k, v in params.items():
+            cmd += ["--" + k, str(v)]
+        try:
+            # own session: Ctrl-C must not kill a running pvesh worker mid-task
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, start_new_session=True)
+        except OSError as e:
+            raise PveError(f"cannot run {self.binary}: {e}") from e
+        if p.returncode != 0:
+            msg = " | ".join(l.strip() for l in (p.stderr or p.stdout).strip().splitlines() if l.strip())
+            raise PveError(f"pvesh {method} {path}: {msg or 'exit code ' + str(p.returncode)}")
+        return p.stdout
+
+    def get(self, path, **params):
+        out = self._run("get", path, params).strip()
+        if not out:
+            return None
+        try:
+            return json.loads(out)
+        except ValueError as e:
+            raise PveError(f"pvesh get {path}: invalid JSON: {e}") from e
+
+    def delete(self, path, **params):
+        m = UPID_RE.search(self._run("delete", path, params))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(self._run("set", path, params))
+        return m.group(0) if m else None
+
+
+class ApiBackend:
+    """Remote: https://host:8006 with an API token (USER@REALM!ID=SECRET)."""
+
+    local = False
+
+    def __init__(self, url, token, verify=True):
+        if "://" not in url:
+            url = "https://" + url
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.port:
+            host = parsed.hostname or ""
+            host = f"[{host}]" if ":" in host else host  # IPv6 literal
+            parsed = parsed._replace(netloc=host + ":8006")
+        self.base = f"{parsed.scheme}://{parsed.netloc}/api2/json"
+        token = token.strip()
+        if token.startswith("PVEAPIToken="):
+            token = token[len("PVEAPIToken="):]
+        self.headers = {"Authorization": "PVEAPIToken=" + token, "Accept": "application/json"}
+        self.ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
+
+    def seg(self, text):
+        """Encode one path segment that may contain '/' (volume ids)."""
+        return urllib.parse.quote(text, safe=":")
+
+    def _req(self, method, path, params):
+        url = self.base + urllib.parse.quote(path, safe="/%:")
+        data, headers = None, dict(self.headers)
+        q = urllib.parse.urlencode(params)
+        if method in ("PUT", "POST"):
+            data = q.encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif q:
+            url += "?" + q
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=120) as r:
+                return json.load(r).get("data")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace").strip()
+            raise PveError(f"{method} {path}: HTTP {e.code} {e.reason} {body}".strip()) from e
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise PveError(f"{method} {path}: {e}") from e
+
+    def get(self, path, **params):
+        return self._req("GET", path, params)
+
+    def delete(self, path, **params):
+        m = UPID_RE.search(str(self._req("DELETE", path, params) or ""))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(str(self._req("PUT", path, params) or ""))
+        return m.group(0) if m else None
+
+
+def make_backend(args):
+    if args.api_url:
+        if not args.token:
+            raise PveError("--api-url needs --token or PVE_TOKEN")
+        return ApiBackend(args.api_url, args.token, verify=not args.insecure)
+    if shutil.which(args.pvesh) or os.path.isfile(args.pvesh):
+        return PveshBackend(args.pvesh)
+    raise PveError("pvesh not found: run on a Proxmox VE node or set --api-url/--token (env PVE_API_URL, PVE_TOKEN)")
+
+
+def wait_task(backend, upid, timeout):
+    """Polls a task until it stops; returns '' or ' [WARNINGS: n]', raises on failure."""
+    node = upid.split(":")[1]
+    path = f"/nodes/{node}/tasks/{upid}"
+    deadline = time.monotonic() + timeout
+    delay, errors = 0.5, 0
+    while True:
+        try:
+            st = backend.get(path + "/status") or {}
+            errors = 0
+        except PveError:
+            # pveproxy restart or network blip: 5 consecutive poll errors are fatal, the task keeps running
+            errors += 1
+            if errors >= 5 or time.monotonic() > deadline:
+                raise
+            st = {}
+        if st.get("status") == "stopped":
+            break
+        if time.monotonic() > deadline:
+            raise PveError(f"task still running after {timeout}s, guest/volume stays locked until it ends: {upid}")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5)
+    es = str(st.get("exitstatus", ""))
+    if es == "OK":
+        return ""
+    if es.startswith("WARNINGS"):
+        return f" [{es}]"
+    tail = ""
+    try:
+        log = backend.get(path + "/log", limit=1000) or []
+        lines = [str(e.get("t", "")) for e in log if e.get("t")][-5:]
+        tail = (" | " + " | ".join(lines)) if lines else ""
+    except PveError:
+        pass
+    raise PveError(f"task failed: {es}{tail}")
+
+
+class Stopper:
+    """SIGINT: first press stops after the running operation, second aborts."""
+
+    def __init__(self):
+        self.stop = False
+        self.old = None
+
+    def __call__(self, signum, frame):
+        if self.stop:
+            raise KeyboardInterrupt
+        self.stop = True
+        print("\nstopping after the running operation(s), Ctrl-C again aborts", file=sys.stderr, flush=True)
+
+    def __enter__(self):
+        self.old = signal.signal(signal.SIGINT, self)
+        return self
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self.old)
+        return False
+
+
+def confirm(args):
+    """True if execution may proceed (--yes or interactive y)."""
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        raise PveError("stdin is not a terminal: pass --yes to confirm")
+    try:
+        return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        print()
+        return False
+
+
+def common_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    conn = common.add_argument_group("connection (default: local pvesh)")
+    conn.add_argument("--api-url", default=os.environ.get("PVE_API_URL"),
+                      help="remote API, e.g. https://pve1:8006 (env PVE_API_URL)")
+    conn.add_argument("--token", default=os.environ.get("PVE_TOKEN"),
+                      help="API token USER@REALM!ID=SECRET (env PVE_TOKEN)")
+    conn.add_argument("--insecure", action="store_true",
+                      default=os.environ.get("PVE_INSECURE", "") not in ("", "0"),
+                      help="skip TLS verification (env PVE_INSECURE=1)")
+    conn.add_argument("--pvesh", default="pvesh", help="pvesh binary (default: pvesh)")
+    common.add_argument("-j", "--jobs", type=positive_int, default=8, help="parallel API reads (default 8)")
+    common.add_argument("--no-color", action="store_true", help="no ANSI colors (also env NO_COLOR)")
+    return common
+
+
+def filter_parser():
+    filt = argparse.ArgumentParser(add_help=False)
+    fg = filt.add_argument_group("guest filters")
+    fg.add_argument("--node", action="append", help="only this node (repeatable)")
+    fg.add_argument("--type", choices=["qemu", "lxc"], help="only VMs or containers")
+    fg.add_argument("--name", type=regex, help="regex on guest name")
+    return filt
+
+
+def guest_filtered(args, vmid, node, gtype, name):
+    """True if the guest passes GUESTS/--node/--type/--name."""
+    if getattr(args, "guests", None) is not None and vmid not in args.guests:
+        return False
+    if args.node and node not in args.node:
+        return False
+    if args.type and gtype != args.type:
+        return False
+    return not (args.name and not args.name.search(name or ""))
+
+
+def run_main(parser, commands, readonly, prog, argv=None):
+    args = parser.parse_args(argv)
+    C.on = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    if args.cmd in readonly and hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        return commands[args.cmd](make_backend(args), args)
+    except PveError as e:
+        print(f"{prog}: error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+# ==== shared:end
+
+
+# node endpoint -> checks that need it
+ENDPOINTS = {"version": ("version",), "status": ("kernel", "rootfs"), "time": ("time",),
+             "apt/versions": ("kernel",), "apt/update": ("updates",), "certificates/info": ("cert",),
+             "disks/list": ("smart",), "disks/zfs": ("zfs",), "disks/lvmthin": ("thin",)}
+LIST_ENDPOINTS = ("version", "status", "apt/versions", "apt/update", "certificates/info")
+CHECKS = ("offline", "quorum", "fetch", "version", "kernel", "updates", "cert", "rootfs", "zfs", "thin", "smart",
+          "time", "ceph")
+KERNEL_PKG_RE = re.compile(r"^(?:pve|proxmox)-kernel-(\d+\.\d+\.\d+-\d+-pve)(?:-signed)?$")
+SMART_OK = {"", "PASSED", "OK", "UNKNOWN", "N/A"}
+CEPH_SEV = {"HEALTH_WARN": "WARN", "HEALTH_ERR": "ERROR"}
+FULL_PCT = 95  # usage at or above this is ERROR, regardless of --max-usage
+
+
+@dataclass
+class Finding:
+    severity: str
+    node: str
+    check: str
+    detail: str
+
+
+@dataclass
+class Node:
+    name: str
+    online: bool
+    data: dict = field(default_factory=dict)      # endpoint -> response
+    errors: dict = field(default_factory=dict)    # endpoint -> message
+    offset: float | None = None                   # node clock minus local request midpoint, seconds
+
+    def get(self, ep, default=None):
+        v = self.data.get(ep)
+        return default if v is None else v
+
+
+def kernel_key(release):
+    return tuple(int(x) for x in re.findall(r"\d+", release or ""))
+
+
+def running_kernel(status):
+    ck = status.get("current-kernel")
+    if isinstance(ck, dict) and ck.get("release"):
+        return ck["release"]
+    parts = str(status.get("kversion") or "").split()  # PVE 7: "Linux 5.15.102-1-pve #1 SMP ..."
+    return parts[1] if len(parts) > 1 else None
+
+
+def newest_kernel(versions):
+    rel = []
+    for e in versions or []:
+        m = KERNEL_PKG_RE.match(str(e.get("Package") or ""))
+        if m and str(e.get("CurrentState") or "Installed") == "Installed":
+            rel.append(m.group(1))
+    return max(rel, key=kernel_key) if rel else None
+
+
+def pct(used, total):
+    used, total = _int(used), _int(total)
+    return 100.0 * used / total if used is not None and total else None
+
+
+def ceph_expected(storage_cfg):
+    """Hyperconverged Ceph: an rbd/cephfs storage without monhost uses the local cluster."""
+    return any(c.get("type") in ("rbd", "cephfs") and not c.get("monhost") for c in storage_cfg or [])
+
+
+def collect(backend, args, endpoints):
+    """Returns (nodes by name, cluster-level findings)."""
+    findings = []
+    nodes = {}
+    for r in backend.get("/cluster/resources", type="node") or []:
+        name = r.get("node")
+        if r.get("type") == "node" and name and (not args.node or name in args.node):
+            nodes[name] = Node(name, r.get("status") == "online")
+    missing = sorted(set(args.node or []) - set(nodes))
+    if missing:
+        raise PveError(f"node(s) not found: {', '.join(missing)}")
+    try:
+        status = backend.get("/cluster/status") or []
+    except PveError as e:
+        status = []
+        findings.append(Finding("WARN", "", "fetch", f"/cluster/status: {e}"))
+    for e in status:
+        if e.get("type") == "cluster" and "quorate" in e and not _int(e.get("quorate")):
+            findings.append(Finding("ERROR", "", "quorum", f"cluster '{e.get('name')}' not quorate: "
+                                                           f"/etc/pve is read-only, no guest start/migration"))
+        if e.get("type") == "node" and e.get("name") in nodes and "online" in e:
+            nodes[e["name"]].online = bool(_int(e.get("online")))
+
+    def fetch(job):
+        node, ep = job
+        t0 = time.time()
+        try:
+            out = backend.get(f"/nodes/{node.name}/{ep}")
+        except PveError as e:
+            node.errors[ep] = str(e)
+            return
+        t1 = time.time()
+        node.data[ep] = out
+        if ep == "time" and isinstance(out, dict) and _int(out.get("time")) is not None:
+            node.offset = _int(out["time"]) - (t0 + t1) / 2
+
+    jobs = [(n, ep) for n in nodes.values() if n.online for ep in endpoints]
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        list(ex.map(fetch, jobs))
+
+    if "ceph" not in getattr(args, "skip", ["ceph"]):
+        try:
+            expected = ceph_expected(backend.get("/storage"))
+        except PveError:
+            expected = False
+        if expected:
+            try:
+                health = (backend.get("/cluster/ceph/status") or {}).get("health") or {}
+                sev = CEPH_SEV.get(health.get("status"))
+                if sev:
+                    msgs = [str((c.get("summary") or {}).get("message") or k)
+                            for k, c in sorted((health.get("checks") or {}).items())]
+                    findings.append(Finding(sev, "", "ceph", f"{health['status']}: " + "; ".join(msgs[:5])))
+            except (PveError, AttributeError) as e:
+                findings.append(Finding("WARN", "", "fetch", f"/cluster/ceph/status: {e}"))
+    return nodes, findings
+
+
+def run_checks(nodes, args, now):
+    out = []
+    for n in sorted(nodes.values(), key=lambda n: n.name):
+        def add(sev, check, detail):
+            out.append(Finding(sev, n.name, check, detail))
+
+        def usage(check, what, used, total):
+            p = pct(used, total)
+            if p is None:
+                return
+            text = f"{what} {p:.0f}% used ({fmt_size(_int(used))} / {fmt_size(_int(total))})"
+            if p >= FULL_PCT:
+                add("ERROR", check, text)
+            elif args.max_usage and p > args.max_usage:
+                add("WARN", check, text)
+
+        if not n.online:
+            add("WARN", "offline", "node offline, not checked")
+            continue
+        for ep, err in sorted(n.errors.items()):
+            add("WARN", "fetch", f"{ep}: {err}")
+        st = n.get("status", {})
+        run, new = running_kernel(st), newest_kernel(n.get("apt/versions"))
+        if run and new and kernel_key(new) > kernel_key(run):
+            add("WARN", "kernel", f"running {run}, newest installed {new}: reboot pending")
+        rootfs = st.get("rootfs") or {}
+        usage("rootfs", "root filesystem", rootfs.get("used"), rootfs.get("total"))
+        ups = n.get("apt/update", [])
+        if ups:
+            names = sorted(str(u.get("Package") or "?") for u in ups)
+            add("INFO", "updates", f"{len(names)} update(s) pending: " + ", ".join(names[:4])
+                + (", ..." if len(names) > 4 else ""))
+        for c in n.get("certificates/info", []):
+            na = _int(c.get("notafter"))
+            if na is None:
+                continue
+            if na <= now:
+                add("ERROR", "cert", f"{c.get('filename')} expired {fmt_time(na)}")
+            elif args.cert_warn and na - now < args.cert_warn:
+                add("WARN", "cert", f"{c.get('filename')} expires {fmt_time(na)} (in {fmt_age(na - now)})")
+        for p in n.get("disks/zfs", []):
+            health = str(p.get("health") or "?")
+            if health != "ONLINE":
+                add("ERROR", "zfs", f"pool {p.get('name')} {health}: zpool status -x")
+            usage("zfs", f"pool {p.get('name')}", p.get("alloc"), p.get("size"))
+        for t in n.get("disks/lvmthin", []):
+            name = f"{t.get('vg')}/{t.get('lv')}"
+            usage("thin", f"thin pool {name} data", t.get("used"), t.get("lv_size"))
+            usage("thin", f"thin pool {name} metadata", t.get("metadata_used"), t.get("metadata_size"))
+        for d in n.get("disks/list", []):
+            health = str(d.get("health") or "").upper()
+            if health not in SMART_OK:
+                what = " ".join(str(x) for x in (d.get("devpath"), d.get("model")) if x)
+                add("ERROR", "smart", f"{what} SMART health {health}")
+
+    online = sorted((n for n in nodes.values() if n.online), key=lambda n: n.name)
+    versions = {}
+    for n in online:
+        v = n.get("version", {}).get("version")
+        if v:
+            versions.setdefault(str(v), []).append(n.name)
+    if len(versions) > 1:
+        out.append(Finding("WARN", "", "version", "pve-manager differs: " + "; ".join(
+            f"{v} ({', '.join(ns)})" for v, ns in sorted(versions.items(), key=lambda kv: kernel_key(kv[0])))))
+    offsets = [(n.name, n.offset) for n in online if n.offset is not None]
+    if len(offsets) > 1 and args.max_skew:
+        lo = min(o for _, o in offsets)
+        spread = max(o for _, o in offsets) - lo
+        if spread > args.max_skew:
+            out.append(Finding("WARN", "", "time", f"clock skew {spread:.0f}s between nodes (> {args.max_skew}s): "
+                               + ", ".join(f"{name} +{o - lo:.0f}s" for name, o in offsets)))
+    return out
+
+
+def cmd_check(backend, args):
+    now = time.time()
+    endpoints = [ep for ep, checks in ENDPOINTS.items() if set(checks) - set(args.skip)]
+    nodes, findings = collect(backend, args, endpoints)
+    findings += run_checks(nodes, args, now)
+    findings = [f for f in findings if f.check not in args.skip]
+    if args.quiet:
+        findings = [f for f in findings if f.severity != "INFO"]
+    findings.sort(key=lambda f: (SEVERITY_RANK[f.severity], f.node, f.check))
+    counts = severity_counts(findings)
+    online = sum(1 for n in nodes.values() if n.online)
+    if args.json:
+        print(json.dumps({"summary": {"nodes": len(nodes), "online": online, **{k.lower(): v for k, v in counts.items()}},
+                          "findings": [asdict(f) for f in findings]}, indent=2))
+    else:
+        if findings:
+            print_findings(findings, [("SEV", lambda f: f.severity), ("NODE", lambda f: f.node or "cluster"),
+                                      ("CHECK", lambda f: f.check), ("DETAIL", lambda f: f.detail)])
+            print()
+        print(f"{len(nodes)} node(s), {online} online: {counts['ERROR']} error, {counts['WARN']} warn, "
+              f"{counts['INFO']} info")
+    return exit_code(counts, args.fail_on)
+
+
+def node_summary(n, now):
+    st = n.get("status", {})
+    run, new = running_kernel(st), newest_kernel(n.get("apt/versions"))
+    certs = [_int(c.get("notafter")) for c in n.get("certificates/info", [])]
+    certs = [c for c in certs if c is not None]
+    return {
+        "node": n.name, "online": n.online, "version": n.get("version", {}).get("version"),
+        "kernel": run, "newest_kernel": new,
+        "reboot": (kernel_key(new) > kernel_key(run)) if run and new else None,
+        "uptime": _int(st.get("uptime")),
+        "updates": len(n.data["apt/update"]) if isinstance(n.data.get("apt/update"), list) else None,
+        "cert_expires": min(certs) if certs else None,
+        "errors": dict(n.errors),
+    }
+
+
+def cmd_list(backend, args):
+    now = time.time()
+    nodes, _ = collect(backend, args, LIST_ENDPOINTS)
+    rows = [node_summary(n, now) for n in sorted(nodes.values(), key=lambda n: n.name)]
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+
+    def opt(v, f=str):
+        return "?" if v is None else f(v)
+
+    table = [[r["node"], "online" if r["online"] else "offline", opt(r["version"]), opt(r["kernel"]),
+              {True: "yes", False: "no", None: "?"}[r["reboot"]], fmt_age(r["uptime"]) if r["uptime"] else "?",
+              opt(r["updates"]), fmt_age(r["cert_expires"] - now) if r["cert_expires"] else "?"]
+             for r in rows if r["online"]]
+    table += [[r["node"], "offline"] + ["-"] * 6 for r in rows if not r["online"]]
+    print_table(["NODE", "STATUS", "PVE", "KERNEL", "REBOOT", "UPTIME", "UPDATES", "CERT"], table)
+    for r in rows:
+        for ep, err in sorted(r["errors"].items()):
+            print(C.yellow(f"warning: {r['node']} {ep}: {err}"), file=sys.stderr)
+    print(f"\n{len(rows)} node(s), {sum(1 for r in rows if r['online'])} online")
+    return 0
+
+
+def build_parser():
+    common = common_parser()
+    common.add_argument("--node", action="append", help="only this node (repeatable)")
+    p = argparse.ArgumentParser(prog="pvenode", description=__doc__.splitlines()[0])
+    p.add_argument("--version", action="version", version=f"pvenode {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.required = True
+
+    sp = sub.add_parser("list", parents=[common], help="version, kernel, reboot, uptime, updates, cert per node")
+    sp.add_argument("--json", action="store_true", help="JSON output")
+
+    sp = sub.add_parser("check", parents=[common], help="audit nodes, exit 1 on findings",
+                        description="Checks: " + ", ".join(CHECKS) + ".")
+    sp.add_argument("--max-usage", type=float, default=85.0,
+                    help=f"warn above root fs / ZFS pool / thin pool usage %% (default 85, 0=off; "
+                         f">= {FULL_PCT} is always ERROR)")
+    sp.add_argument("--cert-warn", type=parse_age, default=parse_age("30d"),
+                    help="warn if a certificate expires within (default 30d, 0=off)")
+    sp.add_argument("--max-skew", type=int, default=5, help="warn above clock skew between nodes, seconds "
+                                                             "(default 5, 0=off)")
+    sp.add_argument("--skip", action="append", default=[], choices=CHECKS, metavar="CHECK",
+                    help="skip a check (repeatable): " + ", ".join(CHECKS))
+    sp.add_argument("--fail-on", choices=["warn", "error", "never"], default="warn",
+                    help="exit 1 threshold (default warn)")
+    sp.add_argument("-q", "--quiet", action="store_true", help="hide INFO findings")
+    sp.add_argument("--json", action="store_true", help="JSON output")
+    return p
+
+
+def main(argv=None):
+    return run_main(build_parser(), {"list": cmd_list, "check": cmd_check}, {"list", "check"}, "pvenode", argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

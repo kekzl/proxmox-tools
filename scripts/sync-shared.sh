@@ -4,7 +4,7 @@
 # Splices lib/shared.py into every tool between the "# ==== shared:" markers.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-for tool in pvesnap pvedisk pvebackup; do
+for tool in pvesnap pvedisk pvebackup pvenode; do
   [ -f "$tool" ] || continue
   awk -v src=lib/shared.py '
     /^# ==== shared:begin/ { print; while ((getline line < src) > 0) print line; close(src); skip = 1; next }

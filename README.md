@@ -7,11 +7,12 @@ Cluster-wide CLI tools for Proxmox VE. Each tool is one file, Python stdlib only
 | [`pvesnap`](#pvesnap) | snapshot trees, snapshot audit, delete chains/branches/by age |
 | [`pvedisk`](#pvedisk) | find and delete orphaned, stale and unused guest volumes on all storages |
 | [`pvebackup`](#pvebackup) | backup audit: job coverage, age, PBS verification, failed jobs, storage usage |
+| [`pvenode`](#pvenode) | node audit: quorum, version drift, pending reboot, updates, certificates, ZFS, thin pools, SMART, clock skew, Ceph |
 
 ## Install
 
 ```sh
-scp pvesnap pvedisk pvebackup root@pve1:/usr/local/sbin/
+scp pvesnap pvedisk pvebackup pvenode root@pve1:/usr/local/sbin/
 ```
 
 | Backend | When | Config |
@@ -24,6 +25,7 @@ scp pvesnap pvedisk pvebackup root@pve1:/usr/local/sbin/
 | `pvesnap` | `VM.Audit`; delete: `VM.Snapshot` |
 | `pvedisk` | `VM.Audit`, `Datastore.Audit`, `Sys.Audit`; delete: `Datastore.Allocate`, `VM.Config.Disk` |
 | `pvebackup` | `VM.Audit`, `Datastore.Audit`, `Sys.Audit` |
+| `pvenode` | `Sys.Audit`, `Datastore.Audit` (Ceph detection); an unreadable endpoint is a `fetch` WARN |
 
 Common: `GUESTS` = `100`, `100,101`, `200-210`, `all`. `check` exits 1 on WARN/ERROR (`--fail-on warn|error|never`), `-q` hides INFO, `--json` for monitoring. Delete commands: `-n` dry run, `-y` no prompt, refused without `-y` on non-tty stdin, Ctrl-C finishes the running operation then stops. Exit codes: 0 ok, 1 findings/failures, 2 usage or fatal error.
 
@@ -129,6 +131,29 @@ Config source: `--config-source auto` reads `/etc/pve/nodes/*/{qemu-server,lxc}/
 | `deleted-guest` backups of guests that no longer exist | INFO | on, unfiltered runs only |
 
 Templates are skipped unless `--templates`.
+
+## pvenode
+
+| Command | Purpose |
+|---|---|
+| `pvenode list` | per node: status, pve-manager version, running kernel, reboot pending, uptime, pending updates, time to first certificate expiry |
+| `pvenode check` | findings table; `--node` (repeatable), `--skip CHECK` (repeatable) |
+
+| Check | Severity | Default |
+|---|---|---|
+| `quorum` cluster not quorate | ERROR | on |
+| `offline` node offline | WARN | on |
+| `fetch` node endpoint unreadable | WARN | on |
+| `version` pve-manager differs between online nodes | WARN | on |
+| `kernel` newer kernel installed than running: reboot pending | WARN | on |
+| `updates` pending apt updates (from the daily apt cache) | INFO | on |
+| `cert` certificate expired | ERROR | on |
+| `cert` certificate expires soon | WARN | `--cert-warn 30d` |
+| `rootfs`, `zfs`, `thin` root fs, ZFS pool, lvm-thin data and metadata usage | WARN / ERROR >= 95% | `--max-usage 85` |
+| `zfs` pool health not `ONLINE` | ERROR | on |
+| `smart` disk SMART health not `PASSED`/`OK` | ERROR | on |
+| `time` clock skew between nodes | WARN | `--max-skew 5` seconds |
+| `ceph` `HEALTH_WARN` / `HEALTH_ERR` | WARN / ERROR | on, only with an rbd/cephfs storage without `monhost` |
 
 ## Development
 
