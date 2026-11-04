@@ -24,7 +24,7 @@ def content_list(st, node, storage):
 def handle(st, method, path, params):
     simple = {"/cluster/resources": "resources", "/cluster/tasks": "tasks", "/cluster/status": "cluster_status",
               "/cluster/replication": "replication", "/cluster/backup": "backup_jobs",
-              "/cluster/backup-info/not-backed-up": "not_backed_up"}
+              "/cluster/backup-info/not-backed-up": "not_backed_up", "/storage": "storage_cfg"}
     if method == "get" and path in simple:
         if path in st.get("errors", {}):
             return 2, st["errors"][path]

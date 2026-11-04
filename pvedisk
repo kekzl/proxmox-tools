@@ -419,7 +419,28 @@ SKIP_KEYS = {"description", "digest", "parent", "snaptime", "snapstate", "delete
              "hostname", "meta", "smbios1", "vmgenid", "net0", "boot"}
 DELETABLE = ("orphan", "stale", "unused")
 KIND_ORDER = {"missing": 0, "orphan": 1, "stale": 2, "scan": 3, "config": 4, "unused": 5, "snapshot-only": 6,
-              "busy": 7}
+              "busy": 7, "alias": 8}
+# storage type -> (key name, storage.cfg fields); LV names are unique per VG, so lvm and lvmthin share "vg"
+BACKING_FIELDS = {"nfs": ("nfs", ("server", "export")), "cifs": ("cifs", ("server", "share", "subdir")),
+                  "zfspool": ("zfspool", ("pool",)), "lvmthin": ("vg", ("vgname",)), "lvm": ("vg", ("vgname",)),
+                  "rbd": ("rbd", ("monhost", "pool", "namespace")), "zfs": ("zfs", ("portal", "target", "pool"))}
+
+
+def backing_keys(cfg):
+    """Identities of the data behind a storage; a shared key = same volumes under two storage IDs."""
+    keys = set()
+    if cfg.get("path"):
+        keys.add(("path", os.path.normpath(cfg["path"])))
+    if cfg.get("type") in BACKING_FIELDS:
+        name, fields = BACKING_FIELDS[cfg["type"]]
+        keys.add((name,) + tuple(str(cfg.get(f) or "").rstrip("/") for f in fields))
+    return keys
+
+
+def storage_aliases(storage_cfg):
+    """[{storage, type, path, pool, ...}] -> {storage: sorted other storage IDs with the same backing}."""
+    keys = {c["storage"]: backing_keys(c) for c in storage_cfg if c.get("storage")}
+    return {st: sorted(o for o in keys if o != st and keys[o] & k) for st, k in keys.items()}
 
 
 # ---------------------------------------------------------------- config parsing
@@ -602,6 +623,10 @@ def scan(backend, args):
                 busy[vmid] = f"task {t.get('type')} running"
     except PveError as e:
         raise PveError(f"cannot read running tasks, refusing to classify volumes: {e}") from e
+    try:
+        aliases = storage_aliases(backend.get("/storage") or [])
+    except PveError as e:
+        raise PveError(f"cannot read storage config, refusing to classify volumes: {e}") from e
     replicas = set()
     try:
         for j in backend.get("/cluster/replication") or []:
@@ -663,7 +688,7 @@ def scan(backend, args):
             findings.append(Finding("WARN", "config", g.node, "", "", g.vmid, None,
                                     f"config unreadable, volumes of {g.vmid} not classified: {g.error}"))
 
-    present, listed_scopes = set(), set()
+    present, listed_scopes, first_copy = set(), set(), {}
     for (node, st, shared), vols, err in listed:
         if err:
             findings.append(Finding("WARN", "scan", node, st, "", None, None, f"cannot list: {err}", shared=shared))
@@ -692,6 +717,19 @@ def scan(backend, args):
                     add("INFO", "snapshot-only",
                         "only referenced by snapshots of " + ", ".join(sorted({str(v) for v, _ in hits})))
                 continue
+            # same volume under another storage ID (e.g. ceph_vm + ceph_ct on one pool): never an orphan
+            alias_hits = [(a, refidx.get(("*" if a in shared_ids else node, a, norm))) for a in aliases.get(st, ())]
+            alias_hits = [(a, h) for a, h in alias_hits if h]
+            if alias_hits:
+                a, h = alias_hits[0]
+                add("INFO", "alias", f"same backing as storage {a}, referenced there by "
+                    + ", ".join(sorted({str(v) for v, _ in h})))
+                continue
+            group = (tuple(sorted([st] + aliases.get(st, []))), scope, norm)
+            if group in first_copy:
+                add("INFO", "alias", f"same volume as {first_copy[group]} (same backing), listed once for deletion")
+                continue
+            first_copy[group] = volid
             if vmid is None or vmid in unreadable:
                 continue
             if vmid in busy:
@@ -738,7 +776,7 @@ def finding_selected(f, args):
 
 def summary_line(findings, info):
     parts = []
-    for kind in ("orphan", "stale", "unused", "missing", "snapshot-only", "busy"):
+    for kind in ("orphan", "stale", "unused", "missing", "snapshot-only", "busy", "alias"):
         sel = [f for f in findings if f.kind == kind]
         if sel:
             size = sum(f.size or 0 for f in sel)
