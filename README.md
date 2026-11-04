@@ -83,6 +83,7 @@ Lists every `images`/`rootdir` volume on every storage (node-local per node, sha
 | `unused` | INFO | detached `unusedN` disk | opt-in, via config `delete unusedN` |
 | `snapshot-only` | INFO | only referenced by snapshots, freed when they are deleted | - |
 | `busy` | INFO | unreferenced, but guest locked or task running | - |
+| `alias` | INFO | same volume under another storage ID with the same backing (pool, VG, path, export) | - |
 
 | Example | Action |
 |---|---|
@@ -95,6 +96,7 @@ Lists every `images`/`rootdir` volume on every storage (node-local per node, sha
 |---|---|
 | guest config unreadable | its volumes never classified as orphan |
 | running tasks unreadable | refused (exit 2) |
+| storage config (`/storage`) unreadable | refused (exit 2), aliases cannot be detected |
 | after confirmation | full re-scan, only unchanged findings are deleted |
 | `unused` | config re-read, value must still match, `digest` guards concurrent edits |
 | after run | storages re-listed, leftovers reported as failed |

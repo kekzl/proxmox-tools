@@ -183,6 +183,51 @@ class EndToEnd(StateCase):
         self.assertNotIn("local-lvm:vm-101-disk-0", self.kinds(data).get("orphan", []))
         self.assertTrue(any(f["kind"] == "config" and f["vmid"] == 101 for f in data["findings"]))
 
+    def test_aliased_storages_never_orphan(self):
+        st = fixture()
+        for node in ("pve1", "pve2"):
+            st["resources"].append({"type": "storage", "node": node, "storage": "ceph-ct", "plugintype": "rbd",
+                                    "shared": 1, "status": "available", "content": "rootdir"})
+        st["storage_cfg"] = [{"storage": "ceph", "type": "rbd", "pool": "vms"},
+                             {"storage": "ceph-ct", "type": "rbd", "pool": "vms", "krbd": 1},
+                             {"storage": "local", "type": "dir", "path": "/var/lib/vz"}]
+        st["content"]["*/ceph-ct"] = [vol("ceph-ct:vm-100-disk-1", 100, 10), vol("ceph-ct:vm-998-disk-0", 998, 7)]
+        self.write(st)
+        _, data = self.check_json()
+        kinds = self.kinds(data)
+        self.assertEqual(kinds["alias"], ["ceph-ct:vm-100-disk-1", "ceph-ct:vm-998-disk-0"])
+        self.assertIn("ceph:vm-998-disk-0", kinds["orphan"])
+        self.assertFalse([v for v in kinds["orphan"] if v.startswith("ceph-ct:")])
+        rc, out, _ = self.run_cli("delete", "-n")
+        self.assertIn("plan: delete 4 volume(s)", out)
+        self.assertNotIn("ceph-ct:vm-100-disk-1", out)
+
+    def test_backing_keys(self):
+        aliases = D.storage_aliases([
+            {"storage": "nfs1", "type": "nfs", "server": "10.0.0.5", "export": "/tank/pve", "path": "/mnt/pve/nfs1"},
+            {"storage": "nfs2", "type": "nfs", "server": "10.0.0.5", "export": "/tank/pve/", "path": "/mnt/pve/nfs2"},
+            {"storage": "ondir", "type": "dir", "path": "/mnt/pve/nfs1/"},
+            {"storage": "zfs-a", "type": "zfspool", "pool": "rpool/data"},
+            {"storage": "zfs-b", "type": "zfspool", "pool": "rpool/other"},
+            {"storage": "thin", "type": "lvmthin", "vgname": "pve", "thinpool": "data"},
+            {"storage": "lvm", "type": "lvm", "vgname": "pve"},
+            {"storage": "lvm2", "type": "lvm", "vgname": "san"},
+        ])
+        self.assertEqual(aliases["nfs1"], ["nfs2", "ondir"])
+        self.assertEqual(aliases["ondir"], ["nfs1"])
+        self.assertEqual(aliases["zfs-a"], [])
+        self.assertEqual(aliases["thin"], ["lvm"])
+        self.assertEqual(aliases["lvm2"], [])
+
+    def test_storage_config_unreadable_is_fatal(self):
+        st = fixture()
+        st["errors"] = {"/storage": "permission denied"}
+        self.write(st)
+        rc, _, err = self.run_cli("delete", "-y")
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot read storage config", err)
+        self.assertEqual(self.calls("delete"), [])
+
     def test_tasks_unreadable_is_fatal(self):
         st = fixture()
         st["errors"] = {"/cluster/tasks": "permission denied"}
