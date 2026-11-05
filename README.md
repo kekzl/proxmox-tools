@@ -81,6 +81,7 @@ A failed delete leaves `lock` and `snapstate=delete`, every retry then dies on t
 | `pvesnap repair 100 -n` | show tree, fixes and resulting tree |
 | `pvesnap repair 100` | confirm, then repair |
 | `pvesnap repair 100 --drop` | same, a snapshot whose force delete fails is removed from the config |
+| `pvesnap repair 100 --drop --chain-ok` | same on `snapshot-as-volume-chain` storage, after verifying the chain by hand |
 
 | Problem | Fix |
 |---|---|
@@ -88,7 +89,7 @@ A failed delete leaves `lock` and `snapstate=delete`, every retry then dies on t
 | parent loop | cut at the oldest member, which rejoins the newest older snapshot outside its subtree |
 | snapshot with missing parent | rejoins the newest older snapshot outside its subtree, else root |
 | live state with missing parent | set to the newest snapshot |
-| `snapstate=prepare` / `delete` | `DELETE snapshot --force` via API, oldest first |
+| `snapstate=prepare` / `delete` | `DELETE snapshot` via API, oldest first, with `--force` except on volume chains |
 
 | Safety | Behaviour |
 |---|---|
@@ -101,7 +102,9 @@ A failed delete leaves `lock` and `snapstate=delete`, every retry then dies on t
 | force delete fails | rest waits, exit 1; a re-run clears the lock it left |
 | `--drop` | only after a failed force delete; storage snapshot and vmstate volume stay |
 | storage snapshots missing in the config | listed, never deleted: may belong to zfs-auto-snapshot or sanoid |
-| `snapshot-as-volume-chain` storage | warning: the qcow2 backing chain is not repaired, check with `qemu-img info --backing-chain` |
+| `snapshot-as-volume-chain` storage | no `--force`, `--drop` refused without `--chain-ok`: force hides a chain that only QEMU memory still holds; chain itself is not repaired, check with `qemu-img info -U --backing-chain` |
+| task ends with warnings | not reported as repaired, exit 1 |
+| storage config unreadable | refused |
 
 ## pvedisk
 

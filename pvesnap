@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 NOW_NODE = "\0now"
 
 # ==== shared:begin
@@ -1080,6 +1080,7 @@ class RepairPlan:
     lock: str | None
     parents: dict
     stuck: list
+    force: bool = True
 
     def __bool__(self):
         return bool(self.lock or self.parents or self.stuck)
@@ -1089,9 +1090,9 @@ class RepairPlan:
         return bool(self.lock or self.parents)
 
 
-def plan_repair(g):
+def plan_repair(g, force=True):
     stuck = sorted((s for s in g.snaps.values() if s.snapstate), key=lambda s: (s.snaptime or 0, s.name))
-    return RepairPlan(g.lock, plan_parents(g), [s.name for s in stuck])
+    return RepairPlan(g.lock, plan_parents(g), [s.name for s in stuck], force)
 
 
 def apply_plan(sections, plan):
@@ -1108,7 +1109,8 @@ def plan_rows(g, plan):
         why = "parent loop" if old in g.snaps else "missing parent"
         who = f"snapshot '{section}'" if section else "live state"
         rows.append(["parent", f"{who}: '{old}' -> {repr(new) if new else 'no parent'} ({why})"])
-    rows += [["delete", f"'{n}' (snapstate={g.snaps[n].snapstate}), --force"] for n in plan.stuck]
+    how = "--force" if plan.force else "no --force: volume chain, a failure must stay visible"
+    rows += [["delete", f"'{n}' (snapstate={g.snaps[n].snapstate}), {how}"] for n in plan.stuck]
     return rows
 
 
@@ -1208,36 +1210,42 @@ def drop_snapshot(backend, g, name, args, path):
         print(C.yellow(f"dropped '{name}' from config, its storage data stays") + f" (backup {backup})", flush=True)
 
 
-def finish_stuck(backend, g, names, args, path):
-    """Force-deletes stuck snapshots; a failed task can leave a lock, so without --drop the rest waits for a re-run."""
+def finish_stuck(backend, g, plan, args, path):
+    """Deletes stuck snapshots, returns True on task warnings. A failed task can leave a lock: the rest waits."""
+    names, warned = plan.stuck, False
     with Stopper() as stopper:
         for i, n in enumerate(names):
             if stopper.stop:
                 print(f"stopped, {len(names) - i} stuck snapshot(s) left")
-                return
+                return warned
             print(f"deleting stuck '{n}' ...", flush=True)
             try:
-                warn = delete_snapshot(backend, g, n, True, args.timeout)
+                warn = delete_snapshot(backend, g, n, plan.force, args.timeout)
+                warned = warned or bool(warn)
                 print(C.green(f"deleted '{n}'") + warn, flush=True)
             except PveError as e:
                 print(C.red(f"FAILED '{n}': {e}"), flush=True)
                 if not args.drop:
-                    return
+                    return warned
                 drop_snapshot(backend, g, n, args, path)
+    return warned
 
 
-def warn_volume_chains(backend, sections):
-    """Chain storages keep real qcow2 backing files: repair only sees the config side."""
+def chain_storages(backend, sections):
+    """Storages of this guest with real qcow2 backing files: force would hide a broken chain.
+
+    PVE deletes the child file before renaming the base: a task dying there leaves a chain only QEMU's memory holds.
+    """
     used = {m.group(1) for lines in sections.values() for m in map(DISK_LINE_RE.match, lines) if m}
     try:
         cfg = backend.get("/storage") or []
     except PveError as e:
-        print(C.yellow(f"cannot check for snapshot-as-volume-chain storages: {e}"))
-        return
+        raise PveError(f"cannot read storage config, refusing to repair: {e}") from e
     chained = sorted(s["storage"] for s in cfg if s.get("storage") in used and _int(s.get("snapshot-as-volume-chain")))
     if chained:
         print(C.yellow(f"storage {', '.join(chained)}: snapshot-as-volume-chain, repair does not touch the qcow2 "
-                       "chain, check with 'qemu-img info --backing-chain'"))
+                       "chain, check with 'qemu-img info -U --backing-chain'"))
+    return chained
 
 
 def report_leftovers(backend, g, all_vmids, sel):
@@ -1265,8 +1273,11 @@ def cmd_repair(backend, args):
     raw, sections = read_conf(path)
     before = conf_tree(g, sections)
     assert_snapshot_lock(g, before.lock)
-    plan = plan_repair(before)
-    warn_volume_chains(backend, sections)
+    chained = chain_storages(backend, sections)
+    if chained and args.drop and not args.chain_ok:
+        raise PveError("--drop on a volume chain can hide a broken qcow2 chain: verify it, then add --chain-ok")
+    force = not chained or args.chain_ok
+    plan = plan_repair(before, force)
     if not plan:
         print(f"{g.vmid}: nothing to repair")
         report_leftovers(backend, before, all_vmids, sel)
@@ -1291,22 +1302,26 @@ def cmd_repair(backend, args):
 
     if plan.edits_config:
         print(f"config written, backup {write_repaired(args, g, path, raw, fixed)}", flush=True)
-    finish_stuck(backend, g, plan.stuck, args, path)
+    warned = finish_stuck(backend, g, plan, args, path)
 
     _, sections = read_conf(path)
     final = build_tree(replace(g, lock=conf_get(sections[""], "lock"), error=None),
                        backend.get(g.path + "/snapshot") or [])
     print()
     print_tree(final, now)
-    left = plan_repair(final)
+    left = plan_repair(final, force)
     if left:
         print_table(["OPEN", "DETAIL"], plan_rows(final, left))
-        hint = "" if args.drop else f", if it keeps failing: pvesnap repair {g.vmid} --drop (keeps storage data)"
+        flags = "--drop" if force else "--drop --chain-ok after verifying the qcow2 chain"
+        hint = "" if args.drop else f", if it keeps failing: pvesnap repair {g.vmid} {flags} (keeps storage data)"
         print(C.red(f"{g.vmid}: not fully repaired") + f": fix the error above, run repair again{hint}")
+    elif warned:
+        print(C.yellow(f"{g.vmid}: config repaired, but the task had warnings: storage side may be incomplete, "
+                       f"read it with 'pvenode task list --vmid {g.vmid}'"))
     else:
         print(C.green(f"{g.vmid}: repaired"))
     report_leftovers(backend, final, all_vmids, sel)
-    return 1 if left else 0
+    return 1 if left or warned else 0
 
 
 # ---------------------------------------------------------------- cli
@@ -1380,6 +1395,8 @@ def build_parser():
     sp.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
     sp.add_argument("--drop", action="store_true",
                     help="if a force delete fails, remove the snapshot from the config, storage data stays")
+    sp.add_argument("--chain-ok", action="store_true",
+                    help="qcow2 chain verified by hand: allow --force and --drop on snapshot-as-volume-chain storage")
     sp.add_argument("--timeout", type=positive_int, default=3600, help="seconds per task (default 3600)")
     sp.add_argument("--backup-dir", default="/var/backups/pvesnap", help="config backups (default /var/backups/pvesnap)")
     sp.add_argument("--pve-dir", default="/etc/pve", help=argparse.SUPPRESS)

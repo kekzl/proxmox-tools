@@ -400,6 +400,65 @@ class RepairLxc(RepairCase):
         self.assertEqual(self.get(), "arch: amd64\nparent: aa\n\n[aa]\nsnaptime: 5\n")
 
 
+class RepairVolumeChain(RepairCase):
+    CHAIN = [{"storage": "local-zfs", "snapshot-as-volume-chain": 1}]
+    STUCK = conf("lock: snapshot-delete\nparent: bb\n", section("aa", 20, snapstate="delete"), section("bb", 10, "aa"))
+
+    def setUp(self):
+        super().setUp()
+        self.put(self.STUCK)
+
+    def test_stuck_snapshot_deleted_without_force(self):
+        self.set_state(storage_cfg=self.CHAIN)
+        rc, out, err = self.repair("-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([c[2] for c in self.calls("delete")], [{}])
+        self.assertIn("no --force", out)
+
+    def test_broken_chain_keeps_snapshot_and_reports_failure(self):
+        self.set_state(storage_cfg=self.CHAIN, fail={"100/aa": "failed to query file information with qemu-img"})
+        rc, out, _ = self.repair("-y")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("[aa]", self.get())
+        self.assertIn("failed to query file information", out)
+        self.assertNotIn(": repaired", out)
+        self.assertIn("--chain-ok", out)
+
+    def test_drop_refused_until_chain_verified(self):
+        self.set_state(storage_cfg=self.CHAIN)
+        rc, _, err = self.repair("-y", "--drop")
+        self.assertEqual(rc, 2)
+        self.assertIn("--chain-ok", err)
+        self.assertEqual(self.get(), self.STUCK)
+        self.assertEqual(self.calls("delete"), [])
+
+    def test_chain_ok_allows_force_and_drop(self):
+        self.set_state(storage_cfg=self.CHAIN, fail_early={"100/aa": "could not find snapshot"})
+        rc, out, err = self.repair("-y", "--drop", "--chain-ok")
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual([c[2] for c in self.calls("delete")], [{"force": "1"}])
+        self.assertNotIn("[aa]", self.get())
+
+    def test_other_storage_keeps_force(self):
+        self.set_state(storage_cfg=[{"storage": "other", "snapshot-as-volume-chain": 1}])
+        self.assertEqual(self.repair("-y")[0], 0)
+        self.assertEqual([c[2] for c in self.calls("delete")], [{"force": "1"}])
+
+    def test_storage_config_unreadable_refused(self):
+        self.set_state(errors={"/storage": "boom"})
+        rc, _, err = self.repair("-y")
+        self.assertEqual(rc, 2)
+        self.assertIn("cannot read storage config", err)
+        self.assertEqual(self.get(), self.STUCK)
+
+    def test_force_warnings_are_not_success(self):
+        self.set_state(fail={"100/aa": "zfs error"})
+        rc, out, _ = self.repair("-y")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("task had warnings", out)
+        self.assertNotIn(": repaired", out)
+
+
 class RepairReports(RepairCase):
     def test_volume_chain_storage_warned(self):
         self.put(conf("parent: aa\n", section("aa", 10)))

@@ -85,7 +85,7 @@ def conf_snapshot_delete(st, node, vmid, name, force, path):
                 del kv["parent"]
     del secs[name], secs[""]["lock"]
     write_conf(path, secs)
-    return new_upid(st, node, "qmdelsnapshot", vmid, "OK")
+    return new_upid(st, node, "qmdelsnapshot", vmid, "WARNINGS: 1" if fail else "OK")  # force only warns
 
 
 def handle(st, method, path, params):
