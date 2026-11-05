@@ -4,7 +4,7 @@ Cluster-wide CLI tools for Proxmox VE. Each tool is one file, Python stdlib only
 
 | Tool | Purpose |
 |---|---|
-| [`pvesnap`](#pvesnap) | snapshot trees, snapshot audit, delete chains/branches/by age |
+| [`pvesnap`](#pvesnap) | snapshot trees, snapshot audit, delete chains/branches/by age, repair stuck or looping snapshot state |
 | [`pvedisk`](#pvedisk) | find and delete orphaned, stale and unused guest volumes on all storages |
 | [`pvebackup`](#pvebackup) | backup audit: job coverage, age, PBS verification, failed jobs, storage usage |
 | [`pvenode`](#pvenode) | node audit: quorum, version drift, pending reboot, updates, certificates, ZFS, thin pools, SMART, clock skew, Ceph |
@@ -22,7 +22,7 @@ scp pvesnap pvedisk pvebackup pvenode root@pve1:/usr/local/sbin/
 
 | Tool | API token privileges |
 |---|---|
-| `pvesnap` | `VM.Audit`; delete: `VM.Snapshot` |
+| `pvesnap` | `VM.Audit`; delete: `VM.Snapshot`; repair: root on the guest's node, no API token |
 | `pvedisk` | `VM.Audit`, `Datastore.Audit`, `Sys.Audit`; delete: `Datastore.Allocate`, `VM.Config.Disk` |
 | `pvebackup` | `VM.Audit`, `Datastore.Audit`, `Sys.Audit` |
 | `pvenode` | `Sys.Audit`, `Datastore.Audit` (Ceph detection); an unreadable endpoint is a `fetch` WARN |
@@ -36,14 +36,15 @@ Common: `GUESTS` = `100`, `100,101`, `200-210`, `all`. `check` exits 1 on WARN/E
 | `pvesnap list [GUESTS]` | snapshot trees with age, RAM state, chain depth; `--flat`, `--json`, `-e` |
 | `pvesnap check [GUESTS]` | findings table |
 | `pvesnap delete GUESTS [SNAP...]` | plan with `DEL` marks in the tree, confirm, delete oldest first, wait per task, verify |
+| `pvesnap repair VMID` | fix stale snapshot lock, parent loops, missing parents, stuck snapshots; see [repair](#repair) |
 
 | Check | Severity | Default |
 |---|---|---|
 | `fetch` snapshot list unreadable (node offline) | ERROR | on |
-| `parent` missing parent reference | ERROR | on |
-| `cycle` parent loop | ERROR | on |
-| `snapstate` half-finished create/delete | ERROR | on, fix: `delete VMID SNAP --force` |
-| `lock` guest lock without running task | WARN | on, hint `qm/pct unlock` |
+| `parent` missing parent reference | ERROR | on, fix: `repair VMID` |
+| `cycle` parent loop | ERROR | on, fix: `repair VMID` |
+| `snapstate` half-finished create/delete | ERROR | on, fix: `repair VMID` |
+| `lock` guest lock without running task | WARN | on, fix: `repair VMID` for snapshot locks, else `qm/pct unlock` |
 | `age` | WARN | `--max-age 30d` |
 | `depth` snapshots between live state and root | WARN | `--max-depth 5` |
 | `count` per guest | WARN | `--max-count 0` (off) |
@@ -70,6 +71,37 @@ Delete selection: base set = named snapshots + `--subtree` + `--upto`, or all sn
 | task fails or times out (`--timeout 3600`) | rest of that guest skipped, other guests continue |
 | after run | snapshot list re-read, leftovers reported as failed |
 | `--parallel N` | N guests at once (default 1) |
+
+### repair
+
+A failed delete leaves `lock` and `snapstate=delete`, every retry then dies on the lock, and a parent loop empties the GUI tree including NOW. The API cannot edit these fields, so `repair` edits the config file and hands stuck snapshots back to PVE.
+
+| Example | Action |
+|---|---|
+| `pvesnap repair 100 -n` | show tree, fixes and resulting tree |
+| `pvesnap repair 100` | confirm, then repair |
+| `pvesnap repair 100 --drop` | same, a snapshot whose force delete fails is removed from the config |
+
+| Problem | Fix |
+|---|---|
+| `lock: snapshot` / `snapshot-delete` | removed |
+| parent loop | cut at the oldest member, which rejoins the newest older snapshot outside its subtree |
+| snapshot with missing parent | rejoins the newest older snapshot outside its subtree, else root |
+| live state with missing parent | set to the newest snapshot |
+| `snapstate=prepare` / `delete` | `DELETE snapshot --force` via API, oldest first |
+
+| Safety | Behaviour |
+|---|---|
+| backend | pvesh only, on the guest's node: PVE's config lock is node-local |
+| running task on the guest, or tasks unreadable | refused |
+| other lock (`backup`, `rollback`, `migrate`, ...) | refused |
+| before writing | config copied to `--backup-dir` (default `/var/backups/pvesnap`, mode 0600) |
+| writing | under PVE's config flock, tmp file + rename, refused if the file changed since it was read |
+| untouched | every line except `lock` and `parent`, including `[PENDING]` and `[special:*]` |
+| force delete fails | rest waits, exit 1; a re-run clears the lock it left |
+| `--drop` | only after a failed force delete; storage snapshot and vmstate volume stay |
+| storage snapshots missing in the config | listed, never deleted: may belong to zfs-auto-snapshot or sanoid |
+| `snapshot-as-volume-chain` storage | warning: the qcow2 backing chain is not repaired, check with `qemu-img info --backing-chain` |
 
 ## pvedisk
 

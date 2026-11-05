@@ -21,6 +21,73 @@ def content_list(st, node, storage):
     return c.get(f"{node}/{storage}", c.get(f"*/{storage}"))
 
 
+def read_conf(path):
+    secs, cur = {"": {}}, ""
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            m = re.fullmatch(r"\[(.+)\]", line)
+            if m:
+                cur = m.group(1)
+                secs[cur] = {}
+            elif ":" in line:
+                k, v = line.split(":", 1)
+                secs[cur][k.strip()] = v.strip()
+    return secs
+
+
+def write_conf(path, secs):
+    with open(path, "w") as f:
+        for name, kv in secs.items():
+            if name:
+                f.write(f"\n[{name}]\n")
+            f.writelines(f"{k}: {v}\n" for k, v in kv.items())
+
+
+def conf_snapshot_list(path):
+    secs = read_conf(path)
+    out = []
+    for name, kv in secs.items():
+        if name and ":" not in name and name.upper() != "PENDING":
+            out.append({"name": name, **{k: kv[k] for k in ("parent", "snaptime", "snapstate") if k in kv}})
+    now = {"name": "current", "description": "You are here!"}
+    if "parent" in secs[""]:
+        now["parent"] = secs[""]["parent"]
+    return out + [now]
+
+
+def conf_snapshot_delete(st, node, vmid, name, force, path):
+    """Mirrors PVE::AbstractConfig::snapshot_delete: runs in the task, keeps lock and snapstate on failure."""
+    secs = read_conf(path)
+    if name not in secs:
+        return 2, f"snapshot '{name}' does not exist"
+    early = st.get("fail_early", {}).get(f"{vmid}/{name}")  # storage activation, not covered by force
+    if early:
+        return new_upid(st, node, "qmdelsnapshot", vmid, early)
+    if "lock" in secs[""]:
+        return new_upid(st, node, "qmdelsnapshot", vmid, f"VM is locked ({secs['']['lock']})")
+    secs[""]["lock"] = "snapshot-delete"
+    secs[name]["snapstate"] = "delete"
+    fail = st.get("fail", {}).get(f"{vmid}/{name}")
+    late = st.get("fail_late", {}).get(f"{vmid}/{name}")  # e.g. template check, after set_lock, not covered by force
+    if late:
+        write_conf(path, secs)
+        return new_upid(st, node, "qmdelsnapshot", vmid, late)
+    if fail and not force:
+        write_conf(path, secs)
+        return new_upid(st, node, "qmdelsnapshot", vmid, fail)
+    parent = secs[name].get("parent")
+    for sec, kv in secs.items():
+        if sec != name and kv.get("parent") == name:
+            if parent:
+                kv["parent"] = parent
+            else:
+                del kv["parent"]
+    del secs[name], secs[""]["lock"]
+    write_conf(path, secs)
+    return new_upid(st, node, "qmdelsnapshot", vmid, "OK")
+
+
 def handle(st, method, path, params):
     simple = {"/cluster/resources": "resources", "/cluster/tasks": "tasks", "/cluster/status": "cluster_status",
               "/cluster/replication": "replication", "/cluster/backup": "backup_jobs",
@@ -51,8 +118,13 @@ def handle(st, method, path, params):
 
     m = re.fullmatch(r"/nodes/([^/]+)/tasks", path)
     if m and method == "get":
+        if path in st.get("errors", {}):
+            return 2, st["errors"][path]
         since = int(params.get("since", 0))
-        return [t for t in st.get("node_tasks", {}).get(m.group(1), []) if t.get("starttime", 0) >= since]
+        tasks = [t for t in st.get("node_tasks", {}).get(m.group(1), []) if t.get("starttime", 0) >= since]
+        if "vmid" in params:
+            tasks = [t for t in tasks if str(t.get("id")) == params["vmid"]]
+        return tasks
 
     m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/(config|pending)", path)
     if m:
@@ -80,6 +152,8 @@ def handle(st, method, path, params):
     if m and method == "get":
         if m.group(3) in st.get("broken_nodes", []):
             return 2, "hostname lookup failed"
+        if m.group(3) in st.get("conf_files", {}):
+            return conf_snapshot_list(st["conf_files"][m.group(3)])
         if m.group(3) in st.get("snapshots", {}):
             snaps = st["snapshots"][m.group(3)]
         else:
@@ -93,12 +167,16 @@ def handle(st, method, path, params):
     if m and method == "get":
         out = {"status": "running"}
         lock = st.get("locks", {}).get(m.group(3))
+        if m.group(3) in st.get("conf_files", {}):
+            lock = read_conf(st["conf_files"][m.group(3)])[""].get("lock")
         if lock:
             out["lock"] = lock
         return out
     m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/snapshot/([^/]+)", path)
     if m and method == "delete":
         node, vmid, name = m.group(1), m.group(3), m.group(4)
+        if vmid in st.get("conf_files", {}):
+            return conf_snapshot_delete(st, node, vmid, name, params.get("force") == "1", st["conf_files"][vmid])
         snaps = st["snapshots"].get(vmid, [])
         target = next((s for s in snaps if s["name"] == name), None)
         if target is None:

@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 Raphael Friedmann
-"""pvesnap - audit and safely bulk-delete Proxmox VE snapshots (QEMU + LXC).
+"""pvesnap - audit, repair and safely bulk-delete Proxmox VE snapshots (QEMU + LXC).
 
 Runs on a PVE node via pvesh, or remotely via API token. Stdlib only, Python >= 3.9.
 """
 from __future__ import annotations
 
 import argparse
+import copy
+import fcntl
 import json
 import os
 import re
@@ -16,6 +18,7 @@ import signal
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -23,9 +26,10 @@ import urllib.parse
 import urllib.request
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field, replace
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 NOW_NODE = "\0now"
 
 # ==== shared:begin
@@ -582,6 +586,8 @@ def tree_rows(g):
     for n in g.snaps:
         if n not in seen:
             rows.append(("?? ", n))
+            if n == g.current_parent:
+                rows.append(("?? ", NOW_NODE))
     return rows
 
 
@@ -657,6 +663,7 @@ DISK_RE = re.compile(r"^(?:vm|base|subvol|basevol)-(\d+)-disk-\d+$")
 STATE_RE = re.compile(r"^vm-(\d+)-state-(.+)$")
 LVSNAP_RE = re.compile(r"^snap_(?:vm|base)-(\d+)-disk-\d+_(.+)$")
 IGNORED_STORAGE_SNAP = re.compile(r"^(__replicate_.*|__migration__)$")
+SNAPSHOT_LOCKS = ("snapshot", "snapshot-delete")
 
 
 def parse_zfs_snapshots(text):
@@ -760,19 +767,23 @@ def run_checks(guests, args, now, tasks):
         if g.lock:
             if str(g.vmid) in running:
                 add("INFO", "lock", f"locked '{g.lock}', task running")
+            elif g.lock in SNAPSHOT_LOCKS:
+                add("WARN", "lock", f"locked '{g.lock}' without running task: pvesnap repair {g.vmid} "
+                                    f"on node {g.node}")
             else:
                 add("WARN", "lock", f"locked '{g.lock}' without running task: stale? '{g.tool} unlock {g.vmid}' "
                                     f"on node {g.node}")
         for snap, parent in g.broken:
-            add("ERROR", "parent", f"snapshot '{snap}' references missing parent '{parent}'")
+            add("ERROR", "parent", f"snapshot '{snap}' references missing parent '{parent}': pvesnap repair {g.vmid}")
         if g.current_parent and g.current_parent not in g.snaps:
-            add("ERROR", "parent", f"live state references missing parent '{g.current_parent}'")
+            add("ERROR", "parent", f"live state references missing parent '{g.current_parent}': "
+                                   f"pvesnap repair {g.vmid}")
         if g.cyclic:
-            add("ERROR", "cycle", f"parent loop through: {', '.join(sorted(g.cyclic))}")
+            add("ERROR", "cycle", f"parent loop through: {', '.join(sorted(g.cyclic))}: pvesnap repair {g.vmid}")
         for s in sorted(g.snaps.values(), key=lambda s: (s.snaptime or 0, s.name)):
             if s.snapstate:
                 add("ERROR", "snapstate", f"snapshot '{s.name}' stuck in snapstate={s.snapstate}: "
-                                          f"pvesnap delete {g.vmid} {s.name} --force")
+                                          f"pvesnap repair {g.vmid}")
             if args.max_age and s.snaptime and now - s.snaptime > args.max_age:
                 add("WARN", "age", f"snapshot '{s.name}' is {fmt_age(now - s.snaptime)} old "
                                    f"(> {fmt_age(args.max_age)})")
@@ -956,6 +967,348 @@ def cmd_delete(backend, args):
     return 1 if errors else rc
 
 
+# ---------------------------------------------------------------- repair
+
+SECTION_RE = re.compile(r"\[([^\]]*)\]\s*$")
+SNAP_SECTION_RE = re.compile(r"[a-z][a-z0-9_-]+", re.I)  # PVE parser; PENDING and special:* are checked before
+DISK_LINE_RE = re.compile(r"(?:scsi|sata|ide|virtio|efidisk|tpmstate|rootfs|mp)\d*:\s*([^:,\s]+):")
+LOCK_FILES = {"qemu": ("/var/lock/qemu-server", "lock-{}.conf"), "lxc": ("/run/lock/lxc", "pve-config-{}.lock")}
+
+
+def parse_conf_sections(text):
+    """Line-exact .conf split: {section: lines}, '' = main; render_conf restores the input."""
+    sections, cur = {"": []}, ""
+    for line in text.split("\n"):
+        m = SECTION_RE.match(line)
+        if not m:
+            sections[cur].append(line)
+            continue
+        cur = m.group(1)
+        if cur in sections:
+            raise PveError(f"duplicate section [{cur}] in config, fix it by hand")
+        sections[cur] = []
+    return sections
+
+
+def render_conf(sections):
+    out = []
+    for name, lines in sections.items():
+        if name:
+            out.append(f"[{name}]")
+        out.extend(lines)
+    return "\n".join(out)
+
+
+def is_snapshot_section(name):
+    return bool(SNAP_SECTION_RE.fullmatch(name)) and name.upper() != "PENDING"
+
+
+def conf_get(lines, key):
+    """Last value wins, like the PVE parser."""
+    vals = [l.split(":", 1)[1].strip() for l in lines if l.startswith(key + ":")]
+    return vals[-1] if vals else None
+
+
+def conf_set(lines, key, value):
+    """Replaces key in place, appends after the last content line, value None removes it."""
+    prefix = key + ":"
+    pos = next((i for i, l in enumerate(lines) if l.startswith(prefix)), None)
+    lines[:] = [l for l in lines if not l.startswith(prefix)]
+    if value is None:
+        return
+    if pos is None:
+        pos = len(lines)
+        while pos and not lines[pos - 1].strip():
+            pos -= 1
+    lines.insert(pos, f"{key}: {value}")
+
+
+def conf_entries(sections):
+    """Sections as /snapshot API entries, for build_tree."""
+    out = []
+    for name, lines in sections.items():
+        if is_snapshot_section(name):
+            out.append({"name": name, "parent": conf_get(lines, "parent"), "snaptime": conf_get(lines, "snaptime"),
+                        "description": urllib.parse.unquote(conf_get(lines, "description") or ""),
+                        "vmstate": 1 if conf_get(lines, "vmstate") else 0, "snapstate": conf_get(lines, "snapstate")})
+    out.append({"name": "current", "parent": conf_get(sections[""], "parent")})
+    return out
+
+
+def conf_tree(g, sections):
+    return build_tree(replace(g, lock=conf_get(sections[""], "lock"), error=None), conf_entries(sections))
+
+
+def plan_parents(g):
+    """{section: new parent or None}, '' = live state. Applied, no parent dangles or loops.
+
+    A loop is cut at its oldest member. Cut and dangling snapshots rejoin the newest older one outside their subtree.
+    """
+    order = sorted(g.snaps, key=lambda n: (g.snaps[n].snaptime or 0, n))
+    parent = {n: s.parent for n, s in g.snaps.items()}
+    cut = {n for n, p in parent.items() if p and p not in g.snaps}
+    parent.update(dict.fromkeys(cut))
+    done = set()
+    for n in order:
+        path, cur = [], n
+        while cur and cur not in done and cur not in path:
+            path.append(cur)
+            cur = parent[cur]
+        if cur in path:
+            root = min(path[path.index(cur):], key=order.index)
+            parent[root] = None
+            cut.add(root)
+        done.update(path)
+
+    def in_subtree(n, top):
+        while n and n != top:
+            n = parent[n]
+        return n == top
+
+    fixes = {}
+    for n in sorted(cut, key=order.index):
+        t = g.snaps[n].snaptime or 0
+        older = [m for m in order if g.snaps[m].snaptime and g.snaps[m].snaptime < t and not in_subtree(m, n)]
+        fixes[n] = parent[n] = older[-1] if older else None
+    if g.current_parent and g.current_parent not in g.snaps:
+        fixes[""] = order[-1] if order else None
+    return fixes
+
+
+@dataclass
+class RepairPlan:
+    lock: str | None
+    parents: dict
+    stuck: list
+
+    def __bool__(self):
+        return bool(self.lock or self.parents or self.stuck)
+
+    @property
+    def edits_config(self):
+        return bool(self.lock or self.parents)
+
+
+def plan_repair(g):
+    stuck = sorted((s for s in g.snaps.values() if s.snapstate), key=lambda s: (s.snaptime or 0, s.name))
+    return RepairPlan(g.lock, plan_parents(g), [s.name for s in stuck])
+
+
+def apply_plan(sections, plan):
+    if plan.lock:
+        conf_set(sections[""], "lock", None)
+    for section, parent in plan.parents.items():
+        conf_set(sections[section], "parent", parent)
+
+
+def plan_rows(g, plan):
+    rows = [["lock", f"clear '{plan.lock}'"]] if plan.lock else []
+    for section, new in plan.parents.items():
+        old = g.snaps[section].parent if section else g.current_parent
+        why = "parent loop" if old in g.snaps else "missing parent"
+        who = f"snapshot '{section}'" if section else "live state"
+        rows.append(["parent", f"{who}: '{old}' -> {repr(new) if new else 'no parent'} ({why})"])
+    rows += [["delete", f"'{n}' (snapstate={g.snaps[n].snapstate}), --force"] for n in plan.stuck]
+    return rows
+
+
+def assert_idle(backend, g):
+    """A running task owns the lock: repairing under it corrupts the config."""
+    try:
+        tasks = backend.get(f"/nodes/{g.node}/tasks", source="active", vmid=g.vmid) or []
+    except PveError as e:
+        raise PveError(f"cannot read running tasks, refusing to repair: {e}") from e
+    running = [str(t.get("upid")) for t in tasks if not t.get("endtime")]
+    if running:
+        raise PveError(f"guest {g.vmid} has running task(s), stop them first: {', '.join(running)}")
+
+
+def assert_snapshot_lock(g, lock):
+    if lock and lock not in SNAPSHOT_LOCKS:
+        raise PveError(f"guest {g.vmid} locked '{lock}': not a snapshot lock, not ours to clear. Resolve it first "
+                       f"('{g.tool} unlock {g.vmid}' only if you know why it is stale)")
+
+
+def read_conf(path):
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise PveError(f"cannot read guest config: {e}") from e
+    return raw, parse_conf_sections(raw.decode("utf-8", "surrogateescape"))
+
+
+@contextmanager
+def config_lock(path, timeout):
+    """Same flock as PVE lock_config: node-local, so repair must run on the guest's node."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a") as f:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise PveError(f"config lock {path} held for {timeout}s, a PVE worker is active") from None
+                time.sleep(0.1)
+        yield
+
+
+def replace_conf(path, old, new, lock_path, timeout=10):
+    """tmp + rename like PVE file_set_contents; no chmod, pmxcfs fixes the mode itself."""
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with config_lock(lock_path, timeout):
+        current, _ = read_conf(path)
+        if current != old:
+            raise PveError(f"{path} changed since it was read, nothing written: run repair again")
+        try:
+            with open(tmp, "wb") as f:
+                f.write(new)
+            os.replace(tmp, path)
+        except OSError as e:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise PveError(f"cannot write {path} (no quorum?): {e}") from e
+
+
+def write_repaired(args, g, path, old, sections):
+    """Backs up, then replaces the config; returns the backup path."""
+    try:
+        os.makedirs(args.backup_dir, mode=0o700, exist_ok=True)
+        fd, backup = tempfile.mkstemp(prefix=f"{g.vmid}-{time.strftime('%Y%m%d-%H%M%S')}-", suffix=".conf",
+                                      dir=args.backup_dir)
+        with os.fdopen(fd, "wb") as f:
+            f.write(old)
+    except OSError as e:
+        raise PveError(f"cannot back up config, nothing written: {e}") from e
+    lock_dir, lock_name = LOCK_FILES[g.type]
+    lock_path = os.path.join(args.lock_dir or lock_dir, lock_name.format(g.vmid))
+    replace_conf(path, old, render_conf(sections).encode("utf-8", "surrogateescape"), lock_path)
+    return backup
+
+
+def drop_section(sections, name):
+    """Config half of PVE snapshot_delete: children and live state move to the dropped snapshot's parent."""
+    parent = conf_get(sections[name], "parent")
+    for section, lines in sections.items():
+        if section != name and (not section or is_snapshot_section(section)) and conf_get(lines, "parent") == name:
+            conf_set(lines, "parent", parent)
+    del sections[name]
+    conf_set(sections[""], "lock", None)
+
+
+def drop_snapshot(backend, g, name, args, path):
+    assert_idle(backend, g)
+    raw, sections = read_conf(path)
+    assert_snapshot_lock(g, conf_get(sections[""], "lock"))
+    if name in sections:
+        drop_section(sections, name)
+        backup = write_repaired(args, g, path, raw, sections)
+        print(C.yellow(f"dropped '{name}' from config, its storage data stays") + f" (backup {backup})", flush=True)
+
+
+def finish_stuck(backend, g, names, args, path):
+    """Force-deletes stuck snapshots; a failed task can leave a lock, so without --drop the rest waits for a re-run."""
+    with Stopper() as stopper:
+        for i, n in enumerate(names):
+            if stopper.stop:
+                print(f"stopped, {len(names) - i} stuck snapshot(s) left")
+                return
+            print(f"deleting stuck '{n}' ...", flush=True)
+            try:
+                warn = delete_snapshot(backend, g, n, True, args.timeout)
+                print(C.green(f"deleted '{n}'") + warn, flush=True)
+            except PveError as e:
+                print(C.red(f"FAILED '{n}': {e}"), flush=True)
+                if not args.drop:
+                    return
+                drop_snapshot(backend, g, n, args, path)
+
+
+def warn_volume_chains(backend, sections):
+    """Chain storages keep real qcow2 backing files: repair only sees the config side."""
+    used = {m.group(1) for lines in sections.values() for m in map(DISK_LINE_RE.match, lines) if m}
+    try:
+        cfg = backend.get("/storage") or []
+    except PveError as e:
+        print(C.yellow(f"cannot check for snapshot-as-volume-chain storages: {e}"))
+        return
+    chained = sorted(s["storage"] for s in cfg if s.get("storage") in used and _int(s.get("snapshot-as-volume-chain")))
+    if chained:
+        print(C.yellow(f"storage {', '.join(chained)}: snapshot-as-volume-chain, repair does not touch the qcow2 "
+                       "chain, check with 'qemu-img info --backing-chain'"))
+
+
+def report_leftovers(backend, g, all_vmids, sel):
+    found = [f for f in check_orphans(backend, [g], all_vmids, sel) if f.severity == "WARN"]
+    if found:
+        print("storage leftovers, not touched (may belong to zfs-auto-snapshot, sanoid, ...):")
+        for f in found:
+            print(f"  {f.detail}")
+
+
+def cmd_repair(backend, args):
+    if not backend.local:
+        raise PveError("repair edits the guest config: run it on the guest's node (pvesh backend)")
+    sel = argparse.Namespace(guests={args.vmid}, node=None, type=None, name=None, jobs=1)
+    guests, all_vmids = load_guests(backend, sel)
+    if not guests:
+        raise PveError(f"guest {args.vmid} not found")
+    g = guests[0]
+    local = os.path.basename(os.path.realpath(os.path.join(args.pve_dir, "local")))
+    if g.node != local:
+        raise PveError(f"guest {g.vmid} is on node {g.node}, this is {local}: run repair on that node, "
+                       "the config lock is node-local")
+    path = os.path.join(args.pve_dir, "nodes", g.node, "qemu-server" if g.type == "qemu" else "lxc", f"{g.vmid}.conf")
+    assert_idle(backend, g)
+    raw, sections = read_conf(path)
+    before = conf_tree(g, sections)
+    assert_snapshot_lock(g, before.lock)
+    plan = plan_repair(before)
+    warn_volume_chains(backend, sections)
+    if not plan:
+        print(f"{g.vmid}: nothing to repair")
+        report_leftovers(backend, before, all_vmids, sel)
+        return 0
+
+    now = time.time()
+    print_tree(before, now)
+    print()
+    print_table(["FIX", "DETAIL"], plan_rows(before, plan))
+    print()
+    fixed = copy.deepcopy(sections)
+    apply_plan(fixed, plan)
+    print("after repair:")
+    print_tree(conf_tree(g, fixed), now, marks=set(plan.stuck))
+    print()
+    if args.dry_run:
+        print("dry run: nothing changed")
+        return 0
+    if not confirm(args):
+        print("aborted")
+        return 1
+
+    if plan.edits_config:
+        print(f"config written, backup {write_repaired(args, g, path, raw, fixed)}", flush=True)
+    finish_stuck(backend, g, plan.stuck, args, path)
+
+    _, sections = read_conf(path)
+    final = build_tree(replace(g, lock=conf_get(sections[""], "lock"), error=None),
+                       backend.get(g.path + "/snapshot") or [])
+    print()
+    print_tree(final, now)
+    left = plan_repair(final)
+    if left:
+        print_table(["OPEN", "DETAIL"], plan_rows(final, left))
+        hint = "" if args.drop else f", if it keeps failing: pvesnap repair {g.vmid} --drop (keeps storage data)"
+        print(C.red(f"{g.vmid}: not fully repaired") + f": fix the error above, run repair again{hint}")
+    else:
+        print(C.green(f"{g.vmid}: repaired"))
+    report_leftovers(backend, final, all_vmids, sel)
+    return 1 if left else 0
+
+
 # ---------------------------------------------------------------- cli
 
 def build_parser():
@@ -1017,11 +1370,25 @@ def build_parser():
                     help="drop from config even if removing the storage snapshot fails (stuck snapstate)")
     ex.add_argument("--timeout", type=positive_int, default=3600, help="seconds per task (default 3600)")
     ex.add_argument("--parallel", type=positive_int, default=1, help="guests processed concurrently (default 1)")
+
+    sp = sub.add_parser("repair", parents=[common], help="fix stale snapshot lock, parent loops, stuck snapshots",
+                        description="Repairs what the API cannot: edits the guest config on this node (backup first), "
+                                    "then force-deletes snapshots stuck in snapstate=prepare/delete. "
+                                    "Refuses on running tasks and non-snapshot locks.")
+    sp.add_argument("vmid", type=positive_int, metavar="VMID")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="show the plan only")
+    sp.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
+    sp.add_argument("--drop", action="store_true",
+                    help="if a force delete fails, remove the snapshot from the config, storage data stays")
+    sp.add_argument("--timeout", type=positive_int, default=3600, help="seconds per task (default 3600)")
+    sp.add_argument("--backup-dir", default="/var/backups/pvesnap", help="config backups (default /var/backups/pvesnap)")
+    sp.add_argument("--pve-dir", default="/etc/pve", help=argparse.SUPPRESS)
+    sp.add_argument("--lock-dir", help=argparse.SUPPRESS)
     return p
 
 
 def main(argv=None):
-    return run_main(build_parser(), {"list": cmd_list, "check": cmd_check, "delete": cmd_delete},
+    return run_main(build_parser(), {"list": cmd_list, "check": cmd_check, "delete": cmd_delete, "repair": cmd_repair},
                     {"list", "check"}, "pvesnap", argv)
 
 
