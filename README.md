@@ -49,7 +49,7 @@ Common: `GUESTS` = `100`, `100,101`, `200-210`, `all`. `check` exits 1 on WARN/E
 | `depth` snapshots between live state and root | WARN | `--max-depth 5` |
 | `count` per guest | WARN | `--max-count 0` (off) |
 | `vmstate` snapshot holds RAM | INFO | on |
-| `orphan` zfs/lvm-thin snapshot or state volume not in config | WARN | `--orphans`, local node only, ignores `__replicate_*` |
+| `orphan` snapshot or state volume on storage but not in config: zfs, lvm-thin, lvm chain, qcow2 internal, qcow2 `snap-*` chain file | WARN | `--orphans`, local node only, ignores `__replicate_*`, qcow2 needs `qemu-img` (one call per image, 30 s timeout) |
 
 Delete selection: base set = named snapshots + `--subtree` + `--upto`, or all snapshots if none given. Then `--match`/`--exclude`/`--older-than` narrow it, `--keep-last N` protects the newest N (counted among `--match`/`--exclude`).
 

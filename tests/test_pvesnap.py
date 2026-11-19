@@ -3,6 +3,9 @@
 
 import argparse
 import json
+import os
+import shutil
+import tempfile
 import time
 import unittest
 
@@ -163,15 +166,102 @@ class CheckTests(unittest.TestCase):
         class LocalBackend:
             local = True
 
+            def get(self, path, **kw):
+                return []
+
         items = [P.StorageSnap("zfs snapshot", "r/vm-100-disk-0@a", 100, "a", False),
                  P.StorageSnap("zfs snapshot", "r/vm-100-disk-0@old", 100, "old", False),
                  P.StorageSnap("zfs state volume", "r/vm-100-state-b", 100, "b", True),
                  P.StorageSnap("zfs snapshot", "r/vm-555-disk-0@q", 555, "q", False)]
         args = P.build_parser().parse_args(["check", "--orphans"])
-        got = P.check_orphans(LocalBackend(), [guest(100)], {100}, args, scanner=lambda: (items, [], True))
+        got = P.check_orphans(LocalBackend(), [guest(100)], {100}, args, scanner=lambda: (items, [], True),
+                              file_scanner=lambda storages, vmids: ([], [], False))
         self.assertEqual(sorted(f.detail.split(":")[0] for f in got),
                          ["zfs snapshot r/vm-100-disk-0@old", "zfs snapshot r/vm-555-disk-0@q",
                           "zfs state volume r/vm-100-state-b"])
+
+    def test_parse_lvs_chain(self):
+        got = P.parse_lvs("  pve snap_vm-100-disk-0_a\n  san snap_vm-100-disk-0_b.qcow2\n  san vm-100-state-b\n"
+                          "  san vm-100-disk-0.qcow2\n")
+        self.assertEqual([(i.kind, i.snap, i.state) for i in got],
+                         [("lvm-thin snapshot", "a", False), ("lvm chain snapshot", "b", False),
+                          ("lvm state volume", "b", True)])
+
+    def file_tree(self, tmp):
+        files = {"nfs/images/100": ["vm-100-disk-0.qcow2", "vm-100-disk-1.raw", "snap-old-vm-100-disk-0.qcow2",
+                                    "snap-a-vm-100-disk-0.qcow2", "vm-100-state-b.raw", "notes.txt"],
+                 "nfs/images/555": ["vm-555-disk-0.qcow2", "snap-my-snap-vm-555-disk-0.qcow2"],
+                 "iso/template": []}
+        for d, names in files.items():
+            os.makedirs(os.path.join(tmp, d))
+            for n in names:
+                open(os.path.join(tmp, d, n), "w").close()
+        return [{"storage": "nfs", "type": "nfs", "path": os.path.join(tmp, "nfs"), "content": "images,iso"},
+                {"storage": "nfs-alias", "type": "dir", "path": os.path.join(tmp, "nfs"), "content": "images"},
+                {"storage": "iso", "type": "dir", "path": os.path.join(tmp, "iso"), "content": "iso"},
+                {"storage": "gone", "type": "dir", "path": os.path.join(tmp, "gone"), "content": "images"},
+                {"storage": "off", "type": "dir", "path": os.path.join(tmp, "nfs"), "disable": 1},
+                {"storage": "elsewhere", "type": "nfs", "path": os.path.join(tmp, "x"), "nodes": "no-such-node"},
+                {"storage": "tank", "type": "zfspool", "pool": "tank"}]
+
+    def test_scan_files(self):
+        internal = {"vm-100-disk-0.qcow2": ["a", "ghost", "__migration__"], "vm-555-disk-0.qcow2": ["q"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            storages = self.file_tree(tmp)
+            info = lambda path: internal[os.path.basename(path)]
+            items, errors, scanned = P.scan_files(storages, info=info)
+            only, _, _ = P.scan_files(storages, vmids={555}, info=info)
+            _, no_tool, _ = P.scan_files(storages, info=None) if not shutil.which("qemu-img") else ([], [], True)
+
+            def broken(path):
+                raise P.PveError(f"qemu-img info {path}: corrupt")
+            partial, broken_errors, _ = P.scan_files(storages, info=broken)
+        self.assertTrue(scanned)
+        self.assertEqual(errors, [f"storage gone: {tmp}/gone/images not found, not scanned"])
+        self.assertEqual(sorted((i.kind, i.ref, i.vmid, i.snap, i.state) for i in items), [
+            ("qcow2 chain file", "nfs:100/snap-a-vm-100-disk-0.qcow2", 100, "a", False),
+            ("qcow2 chain file", "nfs:100/snap-old-vm-100-disk-0.qcow2", 100, "old", False),
+            ("qcow2 chain file", "nfs:555/snap-my-snap-vm-555-disk-0.qcow2", 555, "my-snap", False),
+            ("qcow2 internal snapshot", "nfs:100/vm-100-disk-0.qcow2", 100, "a", False),
+            ("qcow2 internal snapshot", "nfs:100/vm-100-disk-0.qcow2", 100, "ghost", False),
+            ("qcow2 internal snapshot", "nfs:555/vm-555-disk-0.qcow2", 555, "q", False),
+            ("state file", "nfs:100/vm-100-state-b.raw", 100, "b", True)])
+        self.assertEqual({i.vmid for i in only}, {555})
+        if no_tool:
+            self.assertIn("qemu-img not found: internal snapshots of 2 qcow2 image(s) not scanned", no_tool)
+        self.assertEqual(sorted(i.kind for i in partial), ["qcow2 chain file"] * 3 + ["state file"])
+        self.assertEqual(len([e for e in broken_errors if e.endswith(": corrupt")]), 2)
+
+    def test_orphans_files(self):
+        class LocalBackend:
+            local = True
+
+            def __init__(self, storages):
+                self.storages = storages
+
+            def get(self, path, **kw):
+                if self.storages is None:
+                    raise P.PveError("boom")
+                return self.storages
+
+        internal = {"vm-100-disk-0.qcow2": ["a", "ghost"], "vm-555-disk-0.qcow2": ["q"]}
+        args = P.build_parser().parse_args(["check", "--orphans"])
+        none = lambda: ([], [], False)
+        with tempfile.TemporaryDirectory() as tmp:
+            scan = lambda storages, vmids: P.scan_files(storages, vmids, info=lambda p: internal[os.path.basename(p)])
+            got = P.check_orphans(LocalBackend(self.file_tree(tmp)), [guest(100)], {100}, args, scanner=none,
+                                  file_scanner=scan)
+        warn = sorted(f.detail for f in got if f.severity == "WARN")
+        self.assertEqual(warn, [
+            "qcow2 chain file nfs:100/snap-old-vm-100-disk-0.qcow2: snapshot 'old' not in guest config",
+            "qcow2 chain file nfs:555/snap-my-snap-vm-555-disk-0.qcow2: guest does not exist",
+            "qcow2 internal snapshot nfs:100/vm-100-disk-0.qcow2: snapshot 'ghost' not in guest config",
+            "qcow2 internal snapshot nfs:555/vm-555-disk-0.qcow2: guest does not exist",
+            "state file nfs:100/vm-100-state-b.raw: snapshot 'b' has no RAM state in config"])
+        got = P.check_orphans(LocalBackend(None), [guest(100)], {100}, args, scanner=none)
+        self.assertEqual([f.detail for f in got],
+                         ["storage config unreadable, file storages not scanned: boom",
+                          "no zfs, lvs or file storage found, nothing scanned"])
 
 
 class EndToEnd(StateCase):
