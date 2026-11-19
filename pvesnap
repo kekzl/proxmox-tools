@@ -29,7 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 NOW_NODE = "\0now"
 
 # ==== shared:begin
@@ -660,8 +660,13 @@ Finding = namedtuple("Finding", "severity vmid name check detail")
 StorageSnap = namedtuple("StorageSnap", "kind ref vmid snap state")
 
 DISK_RE = re.compile(r"^(?:vm|base|subvol|basevol)-(\d+)-disk-\d+$")
-STATE_RE = re.compile(r"^vm-(\d+)-state-(.+)$")
-LVSNAP_RE = re.compile(r"^snap_(?:vm|base)-(\d+)-disk-\d+_(.+)$")
+# snapshot names never contain '.', so a trailing .raw/.qcow2 is the volume format
+STATE_RE = re.compile(r"^vm-(\d+)-state-(.+?)(?:\.(?:raw|qcow2))?$")
+LVSNAP_RE = re.compile(r"^snap_(?:vm|base)-(\d+)-disk-\d+_(.+?)(\.qcow2)?$")
+CHAIN_FILE_RE = re.compile(r"^snap-(.+)-(?:vm|base)-(\d+)-disk-\d+\.qcow2$")
+QCOW2_RE = re.compile(r"^(?:vm|base)-(\d+)-disk-\d+\.qcow2$")
+FILE_STORAGE_TYPES = ("dir", "nfs", "cifs", "cephfs", "glusterfs")
+QEMU_IMG_TIMEOUT = 30
 IGNORED_STORAGE_SNAP = re.compile(r"^(__replicate_.*|__migration__)$")
 SNAPSHOT_LOCKS = ("snapshot", "snapshot-delete")
 
@@ -696,7 +701,8 @@ def parse_lvs(text):
         vg, lv = parts
         m = LVSNAP_RE.match(lv)
         if m:
-            out.append(StorageSnap("lvm-thin snapshot", f"{vg}/{lv}", int(m.group(1)), m.group(2), False))
+            kind = "lvm chain snapshot" if m.group(3) else "lvm-thin snapshot"
+            out.append(StorageSnap(kind, f"{vg}/{lv}", int(m.group(1)), m.group(2), False))
             continue
         m = STATE_RE.match(lv)
         if m:
@@ -727,15 +733,99 @@ def scan_storage():
     return items, errors, bool(scans)
 
 
-def check_orphans(backend, guests, all_vmids, args, scanner=scan_storage):
+def qcow2_snapshots(path):
+    """Internal snapshot names of one image. -U: a running VM holds the image lock."""
+    cmd = ["qemu-img", "info", "-U", "--output=json", path]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=QEMU_IMG_TIMEOUT)
+        if p.returncode != 0:
+            raise PveError(f"qemu-img info {path}: {p.stderr.strip()}")
+        return [s["name"] for s in json.loads(p.stdout).get("snapshots") or [] if s.get("name")]
+    except subprocess.TimeoutExpired as e:
+        raise PveError(f"qemu-img info {path}: no answer after {QEMU_IMG_TIMEOUT}s") from e
+    except (OSError, ValueError, AttributeError, TypeError) as e:
+        raise PveError(f"qemu-img info {path}: {e}") from e
+
+
+def scan_files(storages, vmids=None, info=None):
+    """qcow2 snapshots on file storages: internal ones, volume-chain snap-* files, RAM state files.
+
+    vmids limits the scan (one qemu-img call per image); storages sharing a path are scanned once.
+    """
+    items, errors, scanned, seen = [], [], False, set()
+    host = os.uname().nodename.split(".")[0]
+    if info is None:
+        info = qcow2_snapshots if shutil.which("qemu-img") else None
+    skipped_images = 0
+    for s in sorted(storages, key=lambda s: str(s.get("storage"))):
+        sid, content, nodes = s.get("storage"), s.get("content"), s.get("nodes")
+        if s.get("type") not in FILE_STORAGE_TYPES or _int(s.get("disable")):
+            continue
+        if (content and "images" not in content.split(",")) or (nodes and host not in nodes.split(",")):
+            continue
+        root = os.path.join(s.get("path") or f"/mnt/pve/{sid}", "images")
+        if not os.path.isdir(root):
+            errors.append(f"storage {sid}: {root} not found, not scanned")
+            continue
+        real = os.path.realpath(root)
+        if real in seen:
+            continue
+        seen.add(real)
+        scanned = True
+        try:
+            dirs = sorted(d for d in os.listdir(root) if d.isdigit())
+        except OSError as e:
+            errors.append(f"storage {sid}: {e}")
+            continue
+        for d in dirs:
+            try:
+                names = sorted(os.listdir(os.path.join(root, d)))
+            except OSError as e:
+                errors.append(f"storage {sid}: {e}")
+                continue
+            for name in names:
+                ref = f"{sid}:{d}/{name}"
+                found = []
+                m = CHAIN_FILE_RE.match(name)
+                if m:
+                    found = [("qcow2 chain file", int(m.group(2)), m.group(1), False)]
+                m = STATE_RE.match(name)
+                if m:
+                    found = [("state file", int(m.group(1)), m.group(2), True)]
+                m = QCOW2_RE.match(name)
+                if m and (vmids is None or int(m.group(1)) in vmids):
+                    if info is None:
+                        skipped_images += 1
+                        continue
+                    try:
+                        found = [("qcow2 internal snapshot", int(m.group(1)), n, False)
+                                 for n in info(os.path.join(root, d, name))]
+                    except PveError as e:
+                        errors.append(str(e))
+                        continue
+                for kind, vmid, snap, state in found:
+                    if (vmids is None or vmid in vmids) and not IGNORED_STORAGE_SNAP.match(snap):
+                        items.append(StorageSnap(kind, ref, vmid, snap, state))
+    if skipped_images:
+        errors.append(f"qemu-img not found: internal snapshots of {skipped_images} qcow2 image(s) not scanned")
+    return items, errors, scanned
+
+
+def check_orphans(backend, guests, all_vmids, args, scanner=scan_storage, file_scanner=scan_files):
     if not backend.local:
-        raise PveError("--orphans scans local zfs/lvm and needs the pvesh backend (run it on the node)")
-    items, errors, scanned = scanner()
-    out = [Finding("INFO", None, "", "orphans", e) for e in errors]
-    if not scanned:
-        out.append(Finding("INFO", None, "", "orphans", "neither zfs nor lvs found, nothing scanned"))
+        raise PveError("--orphans scans local storage and needs the pvesh backend (run it on the node)")
     unfiltered = args.guests is None and not args.node and not args.type and not args.name
     by_vmid = {g.vmid: g for g in guests}
+    items, errors, scanned = scanner()
+    try:
+        f_items, f_errors, f_scanned = file_scanner(backend.get("/storage") or [], None if unfiltered else set(by_vmid))
+    except PveError as e:
+        f_items, f_errors, f_scanned = [], [f"storage config unreadable, file storages not scanned: {e}"], False
+    items, errors, scanned = items + f_items, errors + f_errors, scanned or f_scanned
+    out = [Finding("INFO", None, "", "orphans", e) for e in errors]
+    if not scanned:
+        out.append(Finding("INFO", None, "", "orphans", "no zfs, lvs or file storage found, nothing scanned"))
     for it in items:
         if it.vmid not in all_vmids:
             if unfiltered:
@@ -1348,7 +1438,7 @@ def build_parser():
     sp.add_argument("--max-depth", type=int, default=5, help="warn above chain depth (default 5, 0=off)")
     sp.add_argument("--max-count", type=int, default=0, help="warn above snapshots per guest (default 0=off)")
     sp.add_argument("--orphans", action="store_true",
-                    help="scan local zfs/lvm-thin for snapshots missing in guest configs")
+                    help="scan local zfs, lvm and qcow2 file storages for snapshots missing in guest configs")
     sp.add_argument("--fail-on", choices=["warn", "error", "never"], default="warn",
                     help="exit 1 threshold (default warn)")
     sp.add_argument("-q", "--quiet", action="store_true", help="hide INFO findings")
