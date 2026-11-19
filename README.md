@@ -8,11 +8,12 @@ Cluster-wide CLI tools for Proxmox VE. Each tool is one file, Python stdlib only
 | [`pvedisk`](#pvedisk) | find and delete orphaned, stale and unused guest volumes on all storages |
 | [`pvebackup`](#pvebackup) | backup audit: job coverage, age, PBS verification, failed jobs, storage usage |
 | [`pvenode`](#pvenode) | node audit: quorum, version drift, pending reboot, updates, certificates, ZFS, thin pools, SMART, clock skew, Ceph |
+| [`pverestore`](#pverestore) | restore a VM from a filer snapshot or image directory into a new VM, flat, with a dry run |
 
 ## Install
 
 ```sh
-scp pvesnap pvedisk pvebackup pvenode root@pve1:/usr/local/sbin/
+scp pvesnap pvedisk pvebackup pvenode pverestore root@pve1:/usr/local/sbin/
 ```
 
 | Backend | When | Config |
@@ -26,6 +27,7 @@ scp pvesnap pvedisk pvebackup pvenode root@pve1:/usr/local/sbin/
 | `pvedisk` | `VM.Audit`, `Datastore.Audit`, `Sys.Audit`; delete: `Datastore.Allocate`, `VM.Config.Disk` |
 | `pvebackup` | `VM.Audit`, `Datastore.Audit`, `Sys.Audit` |
 | `pvenode` | `Sys.Audit`, `Datastore.Audit` (Ceph detection); an unreadable endpoint is a `fetch` WARN |
+| `pverestore` | root on a node, no API token |
 
 Common: `GUESTS` = `100`, `100,101`, `200-210`, `all`. `check` exits 1 on WARN/ERROR (`--fail-on warn|error|never`), `-q` hides INFO, `--json` for monitoring. Delete commands: `-n` dry run, `-y` no prompt, refused without `-y` on non-tty stdin, Ctrl-C finishes the running operation then stops. Exit codes: 0 ok, 1 findings/failures, 2 usage or fatal error.
 
@@ -190,14 +192,41 @@ Templates are skipped unless `--templates`.
 | `time` clock skew between nodes | WARN | `--max-skew 5` seconds |
 | `ceph` `HEALTH_WARN` / `HEALTH_ERR` | WARN / ERROR | on, only with an rbd/cephfs storage without `monhost` |
 
+## pverestore
+
+Restores a VM from old disk images into a new VM: a filer snapshot (`.snapshot` on NetApp/NFS, `.zfs/snapshot`) or any directory with the images. Every disk is copied flat with `qemu-img convert`, so internal qcow2 snapshots and backing chains do not survive. The source is only read, the original VM is not touched. Root on a node, no API mode, QEMU only.
+
+| Example | Action |
+|---|---|
+| `pverestore sources 100` | filer snapshots on all file storages that hold images of VM 100 |
+| `pverestore vm 100 --from daily.0 --as 9100 -n` | plan: disks, sizes, snapshots in the source, dropped config keys |
+| `pverestore vm 100 --from daily.0 --as 9100` | new VM 9100 from the config of 100 and the last state of each image |
+| `pverestore vm 100 --from daily.0 --as 9100 --snapshot before-upgrade` | state of that PVE snapshot: internal qcow2 snapshot or `snap-<name>-*` chain file |
+| `pverestore vm 100 --from /mnt/old/images/100 --as 9100 --storage nfs-prod` | images from a directory, all disks to one target storage |
+| `pverestore vm 100 --from /mnt/old/images/100 --as 9100 --storage nfs-prod --no-config` | VM 100 is gone or the id was reused: minimal VM, every image as `scsiN` |
+
+| Topic | Behaviour |
+|---|---|
+| new VM | name `restore-<name>`, not started, `onboot` and `protection` not copied |
+| network | same MAC, `link_down=1` on every NIC: no address conflict with the original |
+| not copied | `hostpci*`, `usb*` with `host=`, passthrough disks, `unusedN`, `vmgenid`, `cipassword` (the API returns it masked) |
+| cloud-init drive | new drive on the target storage, not the volume of the original |
+| image format | from the file extension, never probed: a guest can write a qcow2 header into a raw disk |
+| backing chain | every file must be inside the source, else refused: the result would mix two points in time |
+| disk without source image | refused, `--skip-missing` restores without it |
+| image not in the config | listed, not restored (`--no-config` restores all) |
+| target | file storages only (`dir`, `nfs`, `cifs`, `cephfs`, `glusterfs`), default: storage of each disk; move later with `qm disk move` |
+| failure | nothing is deleted, the leftover VM and volumes are listed with the `qm destroy` command |
+| consistency | a filer snapshot of a running VM is crash-consistent: expect journal replay, databases run recovery |
+
 ## Development
 
 | Path | Purpose |
 |---|---|
 | `lib/shared.py` | backends, parsing, output; embedded in every tool between `# ==== shared:` markers |
 | `scripts/sync-shared.sh` | re-embed `lib/shared.py` after editing it (a test fails on drift) |
-| `scripts/test.sh` | tests in Docker, python 3.9 + 3.13 |
-| `tests/fake_pvesh`, `tests/fake_pvesm` | API fakes backed by a JSON state file |
+| `scripts/test.sh` | tests in Docker, python 3.9 + 3.13, installs `qemu-utils` for the `pverestore` tests |
+| `tests/fake_pvesh`, `tests/fake_pvesm` | API fakes backed by a JSON state file; volume allocation creates real images |
 
 ## License
 

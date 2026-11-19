@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import re
+import subprocess
 import sys
 
 
@@ -98,7 +99,28 @@ def handle(st, method, path, params):
             return 2, st["errors"][path]
         return st.get(simple[path], [])
 
+    m = re.fullmatch(r"/nodes/([^/]+)/qemu", path)
+    if m and method == "create":
+        vmid = params.pop("vmid")
+        if vmid in st.setdefault("configs", {}):
+            return 2, f"VM {vmid} already exists"
+        st["configs"][vmid] = {"config": dict(params)}
+        st.setdefault("resources", []).append({"type": "qemu", "vmid": int(vmid), "node": m.group(1),
+                                               "name": params.get("name", ""), "status": "stopped"})
+        return new_upid(st, m.group(1), "qmcreate", vmid, st.get("fail_create", "OK"))
     m = re.fullmatch(r"/nodes/([^/]+)/storage/([^/]+)/content", path)
+    if m and method == "create":
+        # real image, so qemu-img convert -n has a target
+        cfg = next((s for s in st.get("storage_cfg", []) if s.get("storage") == m.group(2)), None)
+        if cfg is None or st.get("fail_alloc"):
+            return 2, st.get("fail_alloc") or f"storage '{m.group(2)}' does not exist"
+        d = os.path.join(cfg["path"], "images", params["vmid"])
+        os.makedirs(d, exist_ok=True)
+        target = os.path.join(d, params["filename"])
+        subprocess.run(["qemu-img", "create", "-q", "-f", params["format"], target, params["size"] + "K"], check=True)
+        volid = f"{m.group(2)}:{params['vmid']}/{params['filename']}"
+        st.setdefault("volpaths", {})[volid] = target
+        return volid
     if m and method == "get":
         lst = content_list(st, m.group(1), m.group(2))
         if lst is None:
@@ -138,6 +160,11 @@ def handle(st, method, path, params):
         if method == "set":
             if params.get("digest") and params["digest"] != cfg.get("digest", "d0"):
                 return 2, "detected modified configuration - file changed by other user? Try again."
+            if "delete" not in params:
+                if st.get("fail_set"):
+                    return 2, st["fail_set"]
+                cfg["config"].update({k: v for k, v in params.items() if k != "digest"})
+                return None
             key = params["delete"]
             vol = cfg["config"].pop(key).split(",")[0]
             for lst in st.get("content", {}).values():

@@ -1,0 +1,881 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Raphael Friedmann
+"""pverestore - restore a VM from old disk images (filer snapshot or directory) into a new VM.
+
+Copies every disk as a flat image: internal qcow2 snapshots and backing chains do not survive. The source is
+only read, the original VM is not touched. Runs on a PVE node as root via pvesh. Stdlib only, Python >= 3.9.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+
+VERSION = "0.1.0"
+
+# ==== shared:begin
+UPID_RE = re.compile(r"UPID:[^\s\"']+")
+SEVERITY_RANK = {"ERROR": 0, "WARN": 1, "INFO": 2}
+AGE_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}
+
+
+class PveError(Exception):
+    """Fatal or per-item error with a user-facing message."""
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_age(text):
+    m = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([smhdwy]?)\s*", str(text))
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid age '{text}' (examples: 30d, 12h, 2w, 90m)")
+    return int(float(m.group(1)) * AGE_UNITS[m.group(2) or "d"])
+
+
+def parse_idspec(text):
+    """'all' -> None, '100,105,200-210' -> set of vmids."""
+    if text in ("all", "*"):
+        return None
+    ids = set()
+    for part in str(text).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise argparse.ArgumentTypeError(f"invalid guest spec '{part}' (examples: 100, 100,101, 200-210, all)")
+        a, b = int(m.group(1)), int(m.group(2) or m.group(1))
+        if b < a or b - a > 1000000:
+            raise argparse.ArgumentTypeError(f"invalid range '{part}'")
+        ids.update(range(a, b + 1))
+    if not ids:
+        raise argparse.ArgumentTypeError("empty guest spec")
+    return ids
+
+
+def regex(text):
+    try:
+        return re.compile(text)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"invalid regex '{text}': {e}")
+
+
+def positive_int(text):
+    v = _int(text)
+    if v is None or v < 1:
+        raise argparse.ArgumentTypeError(f"expected integer >= 1, got '{text}'")
+    return v
+
+
+def fmt_age(sec):
+    if sec is None:
+        return "?"
+    sec = max(0, int(sec))
+    if sec >= 172800:
+        return f"{sec // 86400}d"
+    if sec >= 3600:
+        return f"{sec // 3600}h"
+    return f"{sec // 60}m"
+
+
+def fmt_time(ts):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def fmt_size(n):
+    if n is None:
+        return "?"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or unit == "TiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def short(text, n=50):
+    line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    return line if len(line) <= n else line[: n - 3] + "..."
+
+
+class C:
+    on = False
+
+    @classmethod
+    def wrap(cls, code, s):
+        return f"\033[{code}m{s}\033[0m" if cls.on and s else s
+
+    @classmethod
+    def red(cls, s):
+        return cls.wrap("31", s)
+
+    @classmethod
+    def yellow(cls, s):
+        return cls.wrap("33", s)
+
+    @classmethod
+    def green(cls, s):
+        return cls.wrap("32", s)
+
+    @classmethod
+    def dim(cls, s):
+        return cls.wrap("2", s)
+
+    @classmethod
+    def bold(cls, s):
+        return cls.wrap("1", s)
+
+
+SEV_COLOR = {"ERROR": C.red, "WARN": C.yellow, "INFO": C.dim}
+
+
+def print_table(headers, rows, colorize=None):
+    widths = [len(h) for h in headers]
+    for r in rows:
+        for i, cell in enumerate(r):
+            widths[i] = max(widths[i], len(str(cell)))
+    last = len(headers) - 1
+    print("  ".join(h if i == last else h.ljust(widths[i]) for i, h in enumerate(headers)))
+    for r in rows:
+        cells = []
+        for i, cell in enumerate(r):
+            s = str(cell) if i == last else str(cell).ljust(widths[i])
+            cells.append(colorize(i, str(cell), s) if colorize else s)
+        print("  ".join(cells).rstrip())
+
+
+def print_findings(findings, columns):
+    """columns: list of (header, getter); first column must be severity."""
+    rows = [[get(f) for _, get in columns] for f in findings]
+    print_table([h for h, _ in columns], rows, colorize=lambda i, raw, s: SEV_COLOR[raw](s) if i == 0 else s)
+
+
+def severity_counts(findings):
+    return {k: sum(1 for f in findings if f.severity == k) for k in SEVERITY_RANK}
+
+
+def exit_code(counts, fail_on):
+    if fail_on == "never":
+        return 0
+    return 1 if counts["ERROR"] or (fail_on == "warn" and counts["WARN"]) else 0
+
+
+class PveshBackend:
+    """Local node: pvesh proxies calls to other cluster nodes itself."""
+
+    local = True
+
+    def __init__(self, binary="pvesh"):
+        self.binary = binary
+
+    def seg(self, text):
+        return text
+
+    def _run(self, method, path, params):
+        cmd = [self.binary, method, path, "--output-format", "json"]
+        for k, v in params.items():
+            cmd += ["--" + k, str(v)]
+        try:
+            # own session: Ctrl-C must not kill a running pvesh worker mid-task
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               universal_newlines=True, start_new_session=True)
+        except OSError as e:
+            raise PveError(f"cannot run {self.binary}: {e}") from e
+        if p.returncode != 0:
+            msg = " | ".join(l.strip() for l in (p.stderr or p.stdout).strip().splitlines() if l.strip())
+            raise PveError(f"pvesh {method} {path}: {msg or 'exit code ' + str(p.returncode)}")
+        return p.stdout
+
+    def get(self, path, **params):
+        out = self._run("get", path, params).strip()
+        if not out:
+            return None
+        try:
+            return json.loads(out)
+        except ValueError as e:
+            raise PveError(f"pvesh get {path}: invalid JSON: {e}") from e
+
+    def delete(self, path, **params):
+        m = UPID_RE.search(self._run("delete", path, params))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(self._run("set", path, params))
+        return m.group(0) if m else None
+
+    def create(self, path, **params):
+        """POST: returns the decoded result, a UPID or a volume id."""
+        out = self._run("create", path, params).strip()
+        try:
+            return json.loads(out) if out else None
+        except ValueError:
+            return out
+
+
+class ApiBackend:
+    """Remote: https://host:8006 with an API token (USER@REALM!ID=SECRET)."""
+
+    local = False
+
+    def __init__(self, url, token, verify=True):
+        if "://" not in url:
+            url = "https://" + url
+        parsed = urllib.parse.urlparse(url)
+        if not parsed.port:
+            host = parsed.hostname or ""
+            host = f"[{host}]" if ":" in host else host  # IPv6 literal
+            parsed = parsed._replace(netloc=host + ":8006")
+        self.base = f"{parsed.scheme}://{parsed.netloc}/api2/json"
+        token = token.strip()
+        if token.startswith("PVEAPIToken="):
+            token = token[len("PVEAPIToken="):]
+        self.headers = {"Authorization": "PVEAPIToken=" + token, "Accept": "application/json"}
+        self.ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
+
+    def seg(self, text):
+        """Encode one path segment that may contain '/' (volume ids)."""
+        return urllib.parse.quote(text, safe=":")
+
+    def _req(self, method, path, params):
+        url = self.base + urllib.parse.quote(path, safe="/%:")
+        data, headers = None, dict(self.headers)
+        q = urllib.parse.urlencode(params)
+        if method in ("PUT", "POST"):
+            data = q.encode()
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        elif q:
+            url += "?" + q
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=120) as r:
+                return json.load(r).get("data")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace").strip()
+            raise PveError(f"{method} {path}: HTTP {e.code} {e.reason} {body}".strip()) from e
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            raise PveError(f"{method} {path}: {e}") from e
+
+    def get(self, path, **params):
+        return self._req("GET", path, params)
+
+    def delete(self, path, **params):
+        m = UPID_RE.search(str(self._req("DELETE", path, params) or ""))
+        return m.group(0) if m else None
+
+    def set(self, path, **params):
+        m = UPID_RE.search(str(self._req("PUT", path, params) or ""))
+        return m.group(0) if m else None
+
+    def create(self, path, **params):
+        return self._req("POST", path, params)
+
+
+def make_backend(args):
+    if args.api_url:
+        if not args.token:
+            raise PveError("--api-url needs --token or PVE_TOKEN")
+        return ApiBackend(args.api_url, args.token, verify=not args.insecure)
+    if shutil.which(args.pvesh) or os.path.isfile(args.pvesh):
+        return PveshBackend(args.pvesh)
+    raise PveError("pvesh not found: run on a Proxmox VE node or set --api-url/--token (env PVE_API_URL, PVE_TOKEN)")
+
+
+def wait_task(backend, upid, timeout):
+    """Polls a task until it stops; returns '' or ' [WARNINGS: n]', raises on failure."""
+    node = upid.split(":")[1]
+    path = f"/nodes/{node}/tasks/{upid}"
+    deadline = time.monotonic() + timeout
+    delay, errors = 0.5, 0
+    while True:
+        try:
+            st = backend.get(path + "/status") or {}
+            errors = 0
+        except PveError:
+            # pveproxy restart or network blip: 5 consecutive poll errors are fatal, the task keeps running
+            errors += 1
+            if errors >= 5 or time.monotonic() > deadline:
+                raise
+            st = {}
+        if st.get("status") == "stopped":
+            break
+        if time.monotonic() > deadline:
+            raise PveError(f"task still running after {timeout}s, guest/volume stays locked until it ends: {upid}")
+        time.sleep(delay)
+        delay = min(delay * 1.5, 5)
+    es = str(st.get("exitstatus", ""))
+    if es == "OK":
+        return ""
+    if es.startswith("WARNINGS"):
+        return f" [{es}]"
+    tail = ""
+    try:
+        log = backend.get(path + "/log", limit=1000) or []
+        lines = [str(e.get("t", "")) for e in log if e.get("t")][-5:]
+        tail = (" | " + " | ".join(lines)) if lines else ""
+    except PveError:
+        pass
+    raise PveError(f"task failed: {es}{tail}")
+
+
+class Stopper:
+    """SIGINT: first press stops after the running operation, second aborts."""
+
+    def __init__(self):
+        self.stop = False
+        self.old = None
+
+    def __call__(self, signum, frame):
+        if self.stop:
+            raise KeyboardInterrupt
+        self.stop = True
+        print("\nstopping after the running operation(s), Ctrl-C again aborts", file=sys.stderr, flush=True)
+
+    def __enter__(self):
+        self.old = signal.signal(signal.SIGINT, self)
+        return self
+
+    def __exit__(self, *exc):
+        signal.signal(signal.SIGINT, self.old)
+        return False
+
+
+def confirm(args):
+    """True if execution may proceed (--yes or interactive y)."""
+    if args.yes:
+        return True
+    if not sys.stdin.isatty():
+        raise PveError("stdin is not a terminal: pass --yes to confirm")
+    try:
+        return input("proceed? [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        print()
+        return False
+
+
+def common_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    conn = common.add_argument_group("connection (default: local pvesh)")
+    conn.add_argument("--api-url", default=os.environ.get("PVE_API_URL"),
+                      help="remote API, e.g. https://pve1:8006 (env PVE_API_URL)")
+    conn.add_argument("--token", default=os.environ.get("PVE_TOKEN"),
+                      help="API token USER@REALM!ID=SECRET (env PVE_TOKEN)")
+    conn.add_argument("--insecure", action="store_true",
+                      default=os.environ.get("PVE_INSECURE", "") not in ("", "0"),
+                      help="skip TLS verification (env PVE_INSECURE=1)")
+    conn.add_argument("--pvesh", default="pvesh", help="pvesh binary (default: pvesh)")
+    common.add_argument("-j", "--jobs", type=positive_int, default=8, help="parallel API reads (default 8)")
+    common.add_argument("--no-color", action="store_true", help="no ANSI colors (also env NO_COLOR)")
+    return common
+
+
+def filter_parser():
+    filt = argparse.ArgumentParser(add_help=False)
+    fg = filt.add_argument_group("guest filters")
+    fg.add_argument("--node", action="append", help="only this node (repeatable)")
+    fg.add_argument("--type", choices=["qemu", "lxc"], help="only VMs or containers")
+    fg.add_argument("--name", type=regex, help="regex on guest name")
+    return filt
+
+
+def guest_filtered(args, vmid, node, gtype, name):
+    """True if the guest passes GUESTS/--node/--type/--name."""
+    if getattr(args, "guests", None) is not None and vmid not in args.guests:
+        return False
+    if args.node and node not in args.node:
+        return False
+    if args.type and gtype != args.type:
+        return False
+    return not (args.name and not args.name.search(name or ""))
+
+
+def run_main(parser, commands, readonly, prog, argv=None):
+    args = parser.parse_args(argv)
+    C.on = sys.stdout.isatty() and not args.no_color and "NO_COLOR" not in os.environ
+    if args.cmd in readonly and hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    try:
+        return commands[args.cmd](make_backend(args), args)
+    except PveError as e:
+        print(f"{prog}: error: {e}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\ninterrupted", file=sys.stderr)
+        return 130
+# ==== shared:end
+
+FILE_STORAGE_TYPES = ("dir", "nfs", "cifs", "cephfs", "glusterfs")
+SNAPDIRS = (".snapshot", os.path.join(".zfs", "snapshot"))  # NetApp/NFS filer, dir storage on ZFS
+IMAGE_RE = re.compile(r"^(?:vm|base)-(\d+)-disk-(\d+)\.(qcow2|raw|vmdk)$")
+CHAIN_FILE_RE = re.compile(r"^snap-(.+)-((?:vm|base)-\d+-disk-\d+\.qcow2)$")
+DRIVE_RE = re.compile(r"^(?:(?:scsi|virtio|sata|ide)\d+|efidisk0|tpmstate0)$")
+NET_RE = re.compile(r"^net\d+$")
+# never copied: identity, state and values the API only returns masked
+DROP_KEYS = ("digest", "vmgenid", "meta", "lock", "parent", "onboot", "protection", "template", "name",
+             "description", "cipassword")
+DROP_RE = re.compile(r"^(?:hostpci\d+|unused\d+)$")
+MINIMAL_CONFIG = {"memory": 2048, "cores": 2, "scsihw": "virtio-scsi-single", "ostype": "l26"}
+INFO_TIMEOUT = 60
+
+
+@dataclass
+class Disk:
+    key: str
+    opts: list
+    sid: str = ""        # storage of the original volume
+    name: str = ""       # image file name in the source directory
+    src: str = ""
+    fmt: str = ""
+    size: int = 0
+    snapshot: str = ""   # internal snapshot for convert -l
+    state: str = ""
+    snaps: list = field(default_factory=list)
+    target: str = ""
+    target_fmt: str = ""
+    error: str = ""
+    missing: bool = False
+    volid: str = ""
+
+
+@dataclass
+class Plan:
+    vmid: int
+    newid: int
+    node: str
+    create: dict
+    late: dict
+    disks: list
+    notes: list
+
+
+# ---------------------------------------------------------------- storage and source
+
+def storage_root(s):
+    return s.get("path") or f"/mnt/pve/{s.get('storage')}"
+
+
+def file_storages(backend, node):
+    """File storages usable on this node, by id."""
+    out = {}
+    for s in backend.get("/storage") or []:
+        nodes = s.get("nodes")
+        if s.get("type") in FILE_STORAGE_TYPES and not _int(s.get("disable")) and (
+                not nodes or node in nodes.split(",")):
+            out[s["storage"]] = s
+    return out
+
+
+def snapshot_dirs(root, vmid):
+    """(snapshot name, snapshot root, image dir) of every filer snapshot holding images of vmid."""
+    out = []
+    for sd in SNAPDIRS:
+        base = os.path.join(root, sd)
+        try:
+            names = sorted(os.listdir(base))
+        except OSError:
+            continue
+        for n in names:
+            d = os.path.join(base, n, "images", str(vmid))
+            if os.path.isdir(d):
+                out.append((n, os.path.join(base, n), d))
+    return out
+
+
+def image_format(name):
+    """By extension, never probed: a guest can write a qcow2 header into its raw disk."""
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    return ext if ext in ("qcow2", "vmdk") else "raw"
+
+
+def image_info(args, path, fmt):
+    cmd = [args.qemu_img, "info", "-U", "--backing-chain", "--output=json", "-f", fmt, path]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=INFO_TIMEOUT)
+        if p.returncode != 0:
+            raise PveError(f"qemu-img info {path}: {p.stderr.strip()}")
+        chain = json.loads(p.stdout)
+        if not isinstance(chain, list) or not chain or "virtual-size" not in chain[0]:
+            raise PveError(f"qemu-img info {path}: unexpected output")
+        return chain
+    except subprocess.TimeoutExpired as e:
+        raise PveError(f"qemu-img info {path}: no answer after {INFO_TIMEOUT}s") from e
+    except (OSError, ValueError) as e:
+        raise PveError(f"qemu-img info {path}: {e}") from e
+
+
+def inside(path, root):
+    real, root = os.path.realpath(str(path)), os.path.realpath(root)
+    return real == root or real.startswith(root + os.sep)
+
+
+def source_dirs(args, storages, vmid):
+    """{storage id or '': (root, image dir)}; '' = one directory given with --from for all disks."""
+    if "/" in args.source:
+        d = os.path.abspath(args.source)
+        if not os.path.isdir(d):
+            raise PveError(f"--from {args.source}: not a directory")
+        parent = os.path.dirname(d)
+        return {"": (os.path.dirname(parent) if os.path.basename(parent) == "images" else d, d)}
+    out = {}
+    for sid, s in sorted(storages.items()):
+        for name, root, d in snapshot_dirs(storage_root(s), vmid):
+            if name == args.source:
+                out[sid] = (root, d)
+                break
+    if not out:
+        raise PveError(f"filer snapshot '{args.source}' holds no images of {vmid} on any file storage of this node: "
+                       f"see 'pverestore sources {vmid}'")
+    return out
+
+
+def chain_snapshots(d, name):
+    try:
+        found = (CHAIN_FILE_RE.match(f) for f in os.listdir(d))
+    except OSError:
+        return []
+    return sorted(m.group(1) for m in found if m and m.group(2) == name)
+
+
+def resolve_disk(args, disk, root, d):
+    """Fills source path, format, size and the state to copy; sets disk.error instead of raising."""
+    names = [disk.name] if "." in disk.name else [disk.name, disk.name + ".raw", disk.name + ".qcow2"]
+    name = next((n for n in names if os.path.isfile(os.path.join(d, n))), None)
+    if name is None:
+        disk.error, disk.missing = f"{os.path.join(d, disk.name)} not found", True
+        return
+    disk.name, disk.fmt = name, image_format(name)
+    path = os.path.join(d, name)
+    chain_names = chain_snapshots(d, name)
+    if args.snapshot in chain_names:
+        path, disk.state = os.path.join(d, f"snap-{args.snapshot}-{name}"), f"chain file of '{args.snapshot}'"
+    try:
+        chain = image_info(args, path, disk.fmt)
+    except PveError as e:
+        disk.error = str(e)
+        return
+    outside = [c.get("filename") for c in chain if not inside(c.get("filename"), root)]
+    if outside:
+        disk.error = f"backing file {outside[0]} is outside the source {root}: result would mix two points in time"
+        return
+    internal = [s["name"] for s in chain[0].get("snapshots") or [] if s.get("name")]
+    disk.snaps = sorted(set(internal) | set(chain_names))
+    if args.snapshot and not disk.state:
+        if args.snapshot not in internal:
+            disk.error = f"{path}: no snapshot '{args.snapshot}' (has: {', '.join(disk.snaps) or 'none'})"
+            return
+        disk.snapshot, disk.state = args.snapshot, f"internal snapshot '{args.snapshot}'"
+    elif not disk.state:
+        disk.state = "active state" + (f", chain of {len(chain)} files" if len(chain) > 1 else "")
+    disk.src, disk.size = path, int(chain[0]["virtual-size"])
+
+
+# ---------------------------------------------------------------- config
+
+def parse_drive(value):
+    vol, _, rest = str(value).partition(",")
+    return vol, [o for o in rest.split(",") if o and not o.startswith("size=")]
+
+
+def split_config(cfg, cloudinit_storage=None):
+    """Guest config -> (create params, late drive params, disks, notes). Late = set after the import."""
+    create, late, disks, notes = {}, {}, [], []
+    for key in sorted(cfg):
+        value = cfg[key]
+        if key in DROP_KEYS or key in ("boot", "bootdisk"):
+            if key == "cipassword":
+                notes.append("cipassword not copied (the API returns it masked): set it again")
+            continue
+        if DROP_RE.match(key) or (re.match(r"^usb\d+$", key) and "host=" in str(value)):
+            if not key.startswith("unused"):
+                notes.append(f"{key} not copied: host device stays with the original VM")
+            continue
+        if NET_RE.match(key):
+            parts = [p for p in str(value).split(",") if not p.startswith("link_down=")]
+            create[key] = ",".join(parts + ["link_down=1"])
+            continue
+        if not DRIVE_RE.match(key):
+            create[key] = value
+            continue
+        vol, opts = parse_drive(value)
+        if "media=cdrom" in opts or vol in ("none", "cdrom"):
+            if "cloudinit" in vol:
+                sid = cloudinit_storage or vol.split(":", 1)[0]
+                late[key] = ",".join([f"{sid}:cloudinit"] + opts)
+            else:
+                late[key] = str(value)
+        elif vol.startswith("/") or ":" not in vol:
+            notes.append(f"{key} not copied: {vol} is not a storage volume")
+        else:
+            sid, volname = vol.split(":", 1)
+            disks.append(Disk(key=key, opts=opts, sid=sid, name=os.path.basename(volname)))
+    return create, late, disks, notes
+
+
+def boot_params(cfg, present):
+    """boot/bootdisk limited to devices the new VM has."""
+    out = {}
+    boot = str(cfg.get("boot") or "")
+    if boot.startswith("order="):
+        devs = [d for d in boot[len("order="):].split(";") if d in present]
+        if devs:
+            out["boot"] = "order=" + ";".join(devs)
+    elif boot:
+        out["boot"] = boot
+    if cfg.get("bootdisk") in present:
+        out["bootdisk"] = cfg["bootdisk"]
+    return out
+
+
+def minimal_disks(dirs, vmid):
+    disks = []
+    for sid, (_, d) in sorted(dirs.items()):
+        for name in sorted(os.listdir(d)):
+            m = IMAGE_RE.match(name)
+            if m and int(m.group(1)) == vmid:
+                disks.append(Disk(key=f"scsi{len(disks)}", opts=[], sid=sid, name=name))
+    return disks
+
+
+def build_plan(backend, args):
+    if not backend.local:
+        raise PveError("pverestore reads image files and needs the pvesh backend (run it on the node)")
+    node = args.local_node
+    guests = {_int(r.get("vmid")): r for r in backend.get("/cluster/resources", type="vm") or []
+              if r.get("type") in ("qemu", "lxc")}
+    if args.newid in guests:
+        raise PveError(f"--as {args.newid}: guest id is in use")
+    storages = file_storages(backend, node)
+    if args.storage and (args.storage not in storages
+                         or "images" not in str(storages[args.storage].get("content") or "images").split(",")):
+        raise PveError(f"--storage {args.storage}: not a file storage with content 'images' on {node} "
+                       f"(supported: {', '.join(FILE_STORAGE_TYPES)})")
+    dirs = source_dirs(args, storages, args.vmid)
+    guest, notes = guests.get(args.vmid), []
+    if guest and guest.get("type") == "lxc":
+        raise PveError(f"{args.vmid} is a container: only VMs are supported")
+    if guest and not args.no_config:
+        cfg = backend.get(f"/nodes/{guest['node']}/qemu/{args.vmid}/config") or {}
+        create, late, disks, notes = split_config(cfg, args.storage)
+        name = f"restore-{guest.get('name') or args.vmid}"[:63]
+    else:
+        notes.append("no guest config used: minimal VM, check bios, machine, disk bus and memory before the start")
+        cfg, create, late, name = {}, dict(MINIMAL_CONFIG), {}, f"restore-{args.vmid}"
+        disks = minimal_disks(dirs, args.vmid)
+        if disks:
+            cfg["boot"] = f"order={disks[0].key}"
+    for d in disks:
+        src = dirs.get("") or dirs.get(d.sid)
+        if src is None:
+            d.error, d.missing = f"storage {d.sid} has no filer snapshot '{args.source}' with images of {args.vmid}", True
+        else:
+            resolve_disk(args, d, *src)
+        d.target = args.storage or d.sid
+        d.target_fmt = d.fmt if d.fmt in ("qcow2", "raw") else "qcow2"
+        if not d.error and (d.target not in storages or "images" not in str(
+                storages[d.target].get("content") or "images").split(",")):
+            d.error = (f"target storage {d.target} is not a file storage with content 'images' on {node}: "
+                       "use --storage") if d.target else "no target storage known: use --storage"
+    if args.skip_missing:
+        notes += [f"{d.key} skipped: {d.error}" for d in disks if d.missing]
+        disks = [d for d in disks if not d.missing]
+    used = {d.name for d in disks}
+    for _, d in dirs.values():
+        extra = sorted(n for n in os.listdir(d) if IMAGE_RE.match(n) and n not in used)
+        if extra:
+            notes.append(f"not in the guest config, not restored: {', '.join(extra)} (--no-config restores all images)")
+    create["name"] = name
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    desc = f"Restored by pverestore on {stamp} from {args.source}" + (
+        f", snapshot {args.snapshot}" if args.snapshot else "") + f", source VM {args.vmid}."
+    create["description"] = desc + ("\n\n" + str(cfg["description"]) if cfg.get("description") else "")
+    present = {d.key for d in disks} | set(late) | {k for k in create if NET_RE.match(k)}
+    late.update(boot_params(cfg, present))
+    return Plan(vmid=args.vmid, newid=args.newid, node=node, create=create, late=late, disks=disks, notes=notes)
+
+
+# ---------------------------------------------------------------- commands
+
+def print_plan(plan):
+    print(C.bold(f"restore VM {plan.vmid} as new VM {plan.newid} '{plan.create['name']}' on {plan.node}"))
+    rows = [[d.key, d.src or d.name, d.fmt or "-", fmt_size(d.size) if d.size else "-", d.state or "-",
+             f"{d.target} ({d.target_fmt})", d.error or "ok"] for d in plan.disks]
+    print_table(["DISK", "SOURCE", "FMT", "SIZE", "STATE", "TARGET", "STATUS"], rows,
+                colorize=lambda i, cell, s: C.red(s) if i == 6 and cell != "ok" else s)
+    for d in plan.disks:
+        if d.snaps:
+            print(f"{d.key}: snapshots in the source (--snapshot NAME): {', '.join(d.snaps)}")
+    for k in sorted(plan.late):
+        print(f"{k}: {plan.late[k]}")
+    nets = sorted(k for k in plan.create if NET_RE.match(k))
+    if nets:
+        print(f"{', '.join(nets)}: same MAC, link_down=1")
+    for n in plan.notes:
+        print(C.yellow(n))
+
+
+def convert(args, disk, dst):
+    cmd = [args.qemu_img, "convert", "-p", "-n", "-f", disk.fmt, "-O", disk.target_fmt]
+    if disk.snapshot:
+        cmd += ["-l", f"snapshot.name={disk.snapshot}"]
+    try:
+        p = subprocess.run(cmd + [disk.src, dst], stderr=subprocess.PIPE, universal_newlines=True)
+    except OSError as e:
+        raise PveError(f"cannot run {args.qemu_img}: {e}") from e
+    if p.returncode != 0:
+        raise PveError(f"qemu-img convert {disk.src}: {p.stderr.strip() or 'exit code ' + str(p.returncode)}")
+
+
+def volume_path(args, volid):
+    try:
+        p = subprocess.run([args.pvesm, "path", volid], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           universal_newlines=True)
+    except OSError as e:
+        raise PveError(f"cannot run {args.pvesm}: {e}") from e
+    if p.returncode != 0 or not p.stdout.strip():
+        raise PveError(f"pvesm path {volid}: {(p.stderr or p.stdout).strip()}")
+    return p.stdout.strip()
+
+
+def execute(backend, args, plan):
+    """Create the VM, import the disks, attach them. Raises PveError; plan.disks[].volid shows what exists."""
+    upid = backend.create(f"/nodes/{plan.node}/qemu", vmid=plan.newid, **plan.create)
+    m = UPID_RE.search(str(upid or ""))
+    if m:
+        wait_task(backend, m.group(0), args.timeout)
+    print(f"VM {plan.newid} created")
+    for i, d in enumerate(plan.disks):
+        filename = f"vm-{plan.newid}-disk-{i}.{d.target_fmt}"
+        d.volid = str(backend.create(f"/nodes/{plan.node}/storage/{d.target}/content", vmid=plan.newid,
+                                     filename=filename, size=-(-d.size // 1024), format=d.target_fmt))  # size: KiB
+        print(f"{d.key}: {d.src} -> {d.volid} ({fmt_size(d.size)}, {d.state})", flush=True)
+        convert(args, d, volume_path(args, d.volid))
+    params = dict(plan.late)
+    params.update({d.key: ",".join([d.volid] + d.opts) for d in plan.disks})
+    backend.set(f"/nodes/{plan.node}/qemu/{plan.newid}/config", **params)
+
+
+def cmd_vm(backend, args):
+    plan = build_plan(backend, args)
+    print_plan(plan)
+    bad = [d for d in plan.disks if d.error]
+    if bad or not plan.disks:
+        hint = " (--skip-missing restores without the missing disks)" if any(d.missing for d in bad) else ""
+        raise PveError(f"{len(bad)} disk(s) cannot be restored{hint}" if bad else "no disk to restore")
+    if args.dry_run:
+        print("dry run, nothing changed")
+        return 0
+    if not confirm(args):
+        print("aborted")
+        return 1
+    try:
+        execute(backend, args, plan)
+    except (PveError, KeyboardInterrupt) as e:
+        made = [d.volid for d in plan.disks if d.volid]
+        print(C.red(f"restore failed: {e or 'interrupted'}"), file=sys.stderr)
+        print(f"left behind: VM {plan.newid} (if created){', volumes ' + ', '.join(made) if made else ''}; "
+              f"remove with 'qm destroy {plan.newid} --purge' after checking", file=sys.stderr)
+        return 1
+    print(C.green(f"VM {plan.newid} restored, not started, NICs are link_down"))
+    print(f"next: qm start {plan.newid}, check it on the console, then enable the NICs or move the disks over")
+    return 0
+
+
+def cmd_sources(backend, args):
+    if not backend.local:
+        raise PveError("pverestore reads image files and needs the pvesh backend (run it on the node)")
+    storages = file_storages(backend, args.local_node)
+    now, rows = time.time(), []
+    for sid, s in sorted(storages.items()):
+        for name, _, d in snapshot_dirs(storage_root(s), args.vmid):
+            images, chain, size, last = 0, 0, 0, 0
+            for f in os.listdir(d):
+                if not (IMAGE_RE.match(f) or CHAIN_FILE_RE.match(f)):
+                    continue
+                try:
+                    st = os.stat(os.path.join(d, f))
+                except OSError:
+                    continue
+                images, chain = images + bool(IMAGE_RE.match(f)), chain + bool(CHAIN_FILE_RE.match(f))
+                size, last = size + st.st_blocks * 512, max(last, int(st.st_mtime))
+            if images:
+                rows.append({"storage": sid, "snapshot": name, "last_write": last, "disks": images,
+                             "chain_files": chain, "size": size, "path": d})
+    rows.sort(key=lambda r: (r["last_write"], r["storage"], r["snapshot"]))
+    if args.json:
+        print(json.dumps({"vmid": args.vmid, "sources": rows}, indent=2))
+        return 0 if rows else 1
+    if not rows:
+        print(f"no filer snapshot with images of {args.vmid} on {len(storages)} file storage(s) "
+              f"(looked in {', '.join(SNAPDIRS)})")
+        return 1
+    print_table(["STORAGE", "SNAPSHOT", "LAST WRITE", "AGE", "DISKS", "CHAIN FILES", "SIZE"],
+                [[r["storage"], r["snapshot"], fmt_time(r["last_write"]), fmt_age(now - r["last_write"]),
+                  r["disks"], r["chain_files"] or "", fmt_size(r["size"])] for r in rows])
+    print(f"\n{len(rows)} source(s). plan a restore: pverestore vm {args.vmid} --from SNAPSHOT --as NEWID -n")
+    return 0
+
+
+def build_parser():
+    common = common_parser()
+    common.add_argument("--pvesm", default="pvesm", help=argparse.SUPPRESS)
+    common.add_argument("--qemu-img", default="qemu-img", help=argparse.SUPPRESS)
+    common.add_argument("--local-node", default=os.uname().nodename.split(".")[0], help=argparse.SUPPRESS)
+
+    p = argparse.ArgumentParser(prog="pverestore", description=__doc__.splitlines()[0])
+    p.add_argument("--version", action="version", version=f"pverestore {VERSION}")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    sub.required = True
+
+    sp = sub.add_parser("sources", parents=[common], help="list filer snapshots that hold images of a VM",
+                        description="Looks in .snapshot (NetApp and other NFS filers) and .zfs/snapshot of every "
+                                    "file storage of this node.")
+    sp.add_argument("vmid", type=positive_int, metavar="VMID")
+    sp.add_argument("--json", action="store_true", help="JSON output")
+
+    sp = sub.add_parser("vm", parents=[common], help="restore old images into a new VM",
+                        formatter_class=argparse.RawDescriptionHelpFormatter,
+                        description="Creates VM NEWID from the config of VMID and a flat copy of each disk image.\n"
+                                    "The new VM is not started, its NICs keep the MAC and get link_down=1.",
+                        epilog="examples:\n"
+                               "  pverestore vm 100 --from daily.2026-11-18_0010 --as 9100 -n\n"
+                               "  pverestore vm 100 --from daily.2026-11-18_0010 --as 9100 --snapshot before-upgrade\n"
+                               "  pverestore vm 100 --from /mnt/old/images/100 --as 9100 --storage nfs-prod\n"
+                               "  pverestore vm 100 --from /mnt/old/images/100 --as 9100 --no-config")
+    sp.add_argument("vmid", type=positive_int, metavar="VMID", help="source VM id (image names, config)")
+    sp.add_argument("--from", dest="source", required=True, metavar="SNAPSHOT|DIR",
+                    help="filer snapshot name (see 'sources'), or a directory with the images (contains '/')")
+    sp.add_argument("--as", dest="newid", required=True, type=positive_int, metavar="NEWID", help="free VM id")
+    sp.add_argument("--snapshot", metavar="NAME",
+                    help="restore the state of this PVE snapshot (internal qcow2 or volume chain), not the last state")
+    sp.add_argument("--storage", metavar="ID", help="target file storage for all disks (default: storage of each disk)")
+    sp.add_argument("--no-config", action="store_true",
+                    help="ignore the config of VMID: minimal VM with every image of the source as scsiN")
+    sp.add_argument("--skip-missing", action="store_true", help="restore without disks that have no source image")
+    sp.add_argument("-n", "--dry-run", action="store_true", help="show the plan only")
+    sp.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
+    sp.add_argument("--timeout", type=positive_int, default=300, help="seconds for the VM create task (default 300)")
+    return p
+
+
+def main(argv=None):
+    return run_main(build_parser(), {"sources": cmd_sources, "vm": cmd_vm}, {"sources"}, "pverestore", argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
