@@ -222,12 +222,17 @@ class PveshBackend:
         return m.group(0) if m else None
 
     def create(self, path, **params):
-        """POST: returns the decoded result, a UPID or a volume id."""
-        out = self._run("create", path, params).strip()
+        """POST: returns the decoded result, a UPID or a volume id.
+
+        The result is the last line: PVE prints tool output in front of it (qemu-img 'Formatting ...' on alloc).
+        """
+        lines = [l for l in self._run("create", path, params).splitlines() if l.strip()]
+        if not lines:
+            return None
         try:
-            return json.loads(out) if out else None
+            return json.loads(lines[-1])
         except ValueError:
-            return out
+            return lines[-1].strip()
 
 
 class ApiBackend:

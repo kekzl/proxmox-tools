@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # ==== shared:begin
 UPID_RE = re.compile(r"UPID:[^\s\"']+")
@@ -221,12 +221,17 @@ class PveshBackend:
         return m.group(0) if m else None
 
     def create(self, path, **params):
-        """POST: returns the decoded result, a UPID or a volume id."""
-        out = self._run("create", path, params).strip()
+        """POST: returns the decoded result, a UPID or a volume id.
+
+        The result is the last line: PVE prints tool output in front of it (qemu-img 'Formatting ...' on alloc).
+        """
+        lines = [l for l in self._run("create", path, params).splitlines() if l.strip()]
+        if not lines:
+            return None
         try:
-            return json.loads(out) if out else None
+            return json.loads(lines[-1])
         except ValueError:
-            return out
+            return lines[-1].strip()
 
 
 class ApiBackend:
@@ -822,8 +827,11 @@ def run_task(backend, result, timeout):
 def import_disks(backend, args, plan, indexes):
     for i, d in zip(indexes, plan.disks):
         filename = f"vm-{plan.newid}-disk-{i}.{d.target_fmt}"
-        d.volid = str(backend.create(f"/nodes/{plan.node}/storage/{d.target}/content", vmid=plan.newid,
-                                     filename=filename, size=-(-d.size // 1024), format=d.target_fmt))  # size: KiB
+        made = str(backend.create(f"/nodes/{plan.node}/storage/{d.target}/content", vmid=plan.newid,
+                                  filename=filename, size=-(-d.size // 1024), format=d.target_fmt))  # size: KiB
+        # file storages name the volume <storage>:<vmid>/<filename>: do not depend on how pvesh prints it
+        expected = f"{d.target}:{plan.newid}/{filename}"
+        d.volid = expected if expected in made else made
         print(f"{d.key}: {d.src} -> {d.volid} ({fmt_size(d.size)}, {d.state})", flush=True)
         convert(args, d, volume_path(args, d.volid))
 
