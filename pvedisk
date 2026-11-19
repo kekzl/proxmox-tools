@@ -221,6 +221,14 @@ class PveshBackend:
         m = UPID_RE.search(self._run("set", path, params))
         return m.group(0) if m else None
 
+    def create(self, path, **params):
+        """POST: returns the decoded result, a UPID or a volume id."""
+        out = self._run("create", path, params).strip()
+        try:
+            return json.loads(out) if out else None
+        except ValueError:
+            return out
+
 
 class ApiBackend:
     """Remote: https://host:8006 with an API token (USER@REALM!ID=SECRET)."""
@@ -275,6 +283,9 @@ class ApiBackend:
     def set(self, path, **params):
         m = UPID_RE.search(str(self._req("PUT", path, params) or ""))
         return m.group(0) if m else None
+
+    def create(self, path, **params):
+        return self._req("POST", path, params)
 
 
 def make_backend(args):

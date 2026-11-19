@@ -14,4 +14,6 @@ jobs:
         python: ["3.9", "3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
+      # pverestore tests convert real images, without qemu-utils they are skipped
+      - run: apt-get update -qq && apt-get install -y -qq --no-install-recommends qemu-utils
       - run: python -m unittest discover -s tests -v
