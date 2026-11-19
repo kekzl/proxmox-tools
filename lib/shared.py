@@ -165,7 +165,8 @@ class PveshBackend:
             cmd += ["--" + k, str(v)]
         try:
             # own session: Ctrl-C must not kill a running pvesh worker mid-task
-            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # no tty on stdin: pvesh would tcsetpgrp it for a worker, which fails outside the tty's session
+            p = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                universal_newlines=True, start_new_session=True)
         except OSError as e:
             raise PveError(f"cannot run {self.binary}: {e}") from e

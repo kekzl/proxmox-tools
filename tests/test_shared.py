@@ -2,6 +2,8 @@
 # Copyright (C) 2026 Raphael Friedmann
 
 import os
+import pty
+import tempfile
 import unittest
 
 from helpers import ROOT, TOOLS, load_tool
@@ -30,6 +32,24 @@ class SharedFunctionTests(unittest.TestCase):
                  "https://pve1:8006/api2/json": "https://pve1:8006/api2/json"}
         for url, want in cases.items():
             self.assertEqual(S.ApiBackend(url, "root@pam!t=x").base, want, url)
+
+    def test_pvesh_never_gets_the_terminal(self):
+        # pvesh fork_worker: 'if ($sync && -t STDIN) tcsetpgrp(...)' dies in the new session _run starts
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "pvesh")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\nif [ -t 0 ]; then echo tty; else readlink /proc/self/fd/0; fi\n")
+            os.chmod(fake, 0o755)
+            master, slave = pty.openpty()
+            saved = os.dup(0)
+            try:
+                os.dup2(slave, 0)
+                self.assertTrue(os.isatty(0))
+                self.assertEqual(S.PveshBackend(fake).create("/nodes/n/qemu", vmid=1), "/dev/null")
+            finally:
+                os.dup2(saved, 0)
+                for fd in (saved, master, slave):
+                    os.close(fd)
 
     def test_wait_task_survives_poll_errors(self):
         upid = "UPID:pve1:0001:0:0:qmdelsnapshot:100:root@pam:"
