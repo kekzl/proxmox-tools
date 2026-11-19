@@ -165,12 +165,23 @@ def handle(st, method, path, params):
                     return 2, st["fail_set"]
                 cfg["config"].update({k: v for k, v in params.items() if k != "digest"})
                 return None
-            key = params["delete"]
-            vol = cfg["config"].pop(key).split(",")[0]
-            for lst in st.get("content", {}).values():
-                lst[:] = [e for e in lst if e["volid"] != vol]
+            for key in params["delete"].split(","):
+                vol = cfg["config"].pop(key).split(",")[0]
+                if key.startswith("unused"):
+                    for lst in st.get("content", {}).values():
+                        lst[:] = [e for e in lst if e["volid"] != vol]
+                else:  # like PVE: a detached disk stays as unusedN
+                    n = next(i for i in range(256) if f"unused{i}" not in cfg["config"])
+                    cfg["config"][f"unused{n}"] = vol
             cfg["digest"] = cfg.get("digest", "d0") + "x"
             return None
+
+    m = re.fullmatch(r"/nodes/([^/]+)/qemu/(\d+)/status/shutdown", path)
+    if m and method == "create":
+        es = st.get("fail_shutdown", "OK")
+        if es == "OK":
+            st.setdefault("vm_status", {})[m.group(2)] = "stopped"
+        return new_upid(st, m.group(1), "qmshutdown", m.group(2), es)
 
     m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/snapshot/([^/]+)/config", path)
     if m and method == "get":
@@ -192,7 +203,7 @@ def handle(st, method, path, params):
         return snaps + [now]
     m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/status/current", path)
     if m and method == "get":
-        out = {"status": "running"}
+        out = {"status": st.get("vm_status", {}).get(m.group(3), "running")}
         lock = st.get("locks", {}).get(m.group(3))
         if m.group(3) in st.get("conf_files", {}):
             lock = read_conf(st["conf_files"][m.group(3)])[""].get("lock")

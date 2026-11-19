@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 # ==== shared:begin
 UPID_RE = re.compile(r"UPID:[^\s\"']+")
@@ -451,6 +451,7 @@ class Disk:
     error: str = ""
     missing: bool = False
     volid: str = ""
+    old: str = ""        # volume the key points to in the guest config
 
 
 @dataclass
@@ -462,6 +463,11 @@ class Plan:
     late: dict
     disks: list
     notes: list
+    replace: bool = False
+    running: bool = False
+    storages: dict = field(default_factory=dict)
+    config_text: str = ""
+    phase: str = ""      # replace: '' -> 'detached' -> 'done'
 
 
 # ---------------------------------------------------------------- storage and source
@@ -624,7 +630,7 @@ def split_config(cfg, cloudinit_storage=None):
             notes.append(f"{key} not copied: {vol} is not a storage volume")
         else:
             sid, volname = vol.split(":", 1)
-            disks.append(Disk(key=key, opts=opts, sid=sid, name=os.path.basename(volname)))
+            disks.append(Disk(key=key, opts=opts, sid=sid, name=os.path.basename(volname), old=vol))
     return create, late, disks, notes
 
 
@@ -653,13 +659,53 @@ def minimal_disks(dirs, vmid):
     return disks
 
 
+def check_replace(args, guest, node):
+    """--replace changes the original VM: refuse every state where the swap could not finish cleanly."""
+    if args.no_config:
+        raise PveError("--replace needs the config of the VM: not with --no-config")
+    if not guest or guest.get("type") != "qemu":
+        raise PveError(f"--replace: VM {args.vmid} does not exist")
+    if guest.get("node") != node:
+        raise PveError(f"--replace: VM {args.vmid} is on node {guest.get('node')}, run pverestore there")
+    if _int(guest.get("template")):
+        raise PveError(f"--replace: {args.vmid} is a template")
+    if guest.get("lock"):
+        raise PveError(f"--replace: VM {args.vmid} is locked ({guest['lock']})")
+    if guest.get("status") != "stopped" and not args.shutdown:
+        raise PveError(f"--replace: VM {args.vmid} is {guest.get('status')}: stop it, or pass --shutdown "
+                       "(shuts it down after the copy, before the swap)")
+
+
+def free_disk_indexes(plan, count):
+    """Unused N for vm-<vmid>-disk-N: not in the config, no file (image or chain file) on any file storage."""
+    pat = re.compile(rf"(?:vm|base)-{plan.vmid}-disk-(\d+)")
+    used = {int(n) for n in pat.findall(plan.config_text)}
+    for s in plan.storages.values():
+        try:
+            names = os.listdir(os.path.join(storage_root(s), "images", str(plan.vmid)))
+        except OSError:
+            continue
+        used |= {int(n) for f in names for n in pat.findall(f)}
+    out, n = [], 0
+    while len(out) < count:
+        if n not in used:
+            out.append(n)
+        n += 1
+    return out
+
+
 def build_plan(backend, args):
     if not backend.local:
         raise PveError("pverestore reads image files and needs the pvesh backend (run it on the node)")
     node = args.local_node
     guests = {_int(r.get("vmid")): r for r in backend.get("/cluster/resources", type="vm") or []
               if r.get("type") in ("qemu", "lxc")}
-    if args.newid in guests:
+    if bool(args.newid) == bool(args.replace):
+        raise PveError("pass exactly one of --as NEWID (new VM) or --replace (swap the disks of VMID)")
+    if args.replace:
+        check_replace(args, guests.get(args.vmid), node)
+        args.newid = args.vmid
+    elif args.newid in guests:
         raise PveError(f"--as {args.newid}: guest id is in use")
     storages = file_storages(backend, node)
     if args.storage and (args.storage not in storages
@@ -707,13 +753,25 @@ def build_plan(backend, args):
     create["description"] = desc + ("\n\n" + str(cfg["description"]) if cfg.get("description") else "")
     present = {d.key for d in disks} | set(late) | {k for k in create if NET_RE.match(k)}
     late.update(boot_params(cfg, present))
-    return Plan(vmid=args.vmid, newid=args.newid, node=node, create=create, late=late, disks=disks, notes=notes)
+    if args.replace:
+        # the VM keeps its config: only notes about the disks apply
+        notes = [n for n in notes if "skipped" in n or "not restored" in n]
+        notes += [f"{d.key} keeps its current content: restored and old disks will be from different points in time"
+                  for d in split_config(cfg)[2] if d.key not in {x.key for x in disks}]
+        notes.append("old disks stay attached as unusedN; PVE snapshots of the VM keep pointing to them")
+    return Plan(vmid=args.vmid, newid=args.newid, node=node, create=create, late=late, disks=disks, notes=notes,
+                replace=args.replace, running=bool(guest) and guest.get("status") != "stopped", storages=storages,
+                config_text=json.dumps(cfg))
 
 
 # ---------------------------------------------------------------- commands
 
 def print_plan(plan):
-    print(C.bold(f"restore VM {plan.vmid} as new VM {plan.newid} '{plan.create['name']}' on {plan.node}"))
+    if plan.replace:
+        print(C.bold(f"REPLACE the disks of VM {plan.vmid} on {plan.node} in place"
+                     + (", VM is running and will be shut down for the swap" if plan.running else "")))
+    else:
+        print(C.bold(f"restore VM {plan.vmid} as new VM {plan.newid} '{plan.create['name']}' on {plan.node}"))
     rows = [[d.key, d.src or d.name, d.fmt or "-", fmt_size(d.size) if d.size else "-", d.state or "-",
              f"{d.target} ({d.target_fmt})", d.error or "ok"] for d in plan.disks]
     print_table(["DISK", "SOURCE", "FMT", "SIZE", "STATE", "TARGET", "STATUS"], rows,
@@ -721,10 +779,12 @@ def print_plan(plan):
     for d in plan.disks:
         if d.snaps:
             print(f"{d.key}: snapshots in the source (--snapshot NAME): {', '.join(d.snaps)}")
-    for k in sorted(plan.late):
+    for k in sorted(plan.late) if not plan.replace else ():
         print(f"{k}: {plan.late[k]}")
     nets = sorted(k for k in plan.create if NET_RE.match(k))
-    if nets:
+    if plan.replace:
+        print("config, NICs and VM id stay as they are; vmgenid is renewed; the VM is left stopped")
+    elif nets:
         print(f"{', '.join(nets)}: same MAC, link_down=1")
     for n in plan.notes:
         print(C.yellow(n))
@@ -753,22 +813,75 @@ def volume_path(args, volid):
     return p.stdout.strip()
 
 
-def execute(backend, args, plan):
-    """Create the VM, import the disks, attach them. Raises PveError; plan.disks[].volid shows what exists."""
-    upid = backend.create(f"/nodes/{plan.node}/qemu", vmid=plan.newid, **plan.create)
-    m = UPID_RE.search(str(upid or ""))
+def run_task(backend, result, timeout):
+    m = UPID_RE.search(str(result or ""))
     if m:
-        wait_task(backend, m.group(0), args.timeout)
-    print(f"VM {plan.newid} created")
-    for i, d in enumerate(plan.disks):
+        wait_task(backend, m.group(0), timeout)
+
+
+def import_disks(backend, args, plan, indexes):
+    for i, d in zip(indexes, plan.disks):
         filename = f"vm-{plan.newid}-disk-{i}.{d.target_fmt}"
         d.volid = str(backend.create(f"/nodes/{plan.node}/storage/{d.target}/content", vmid=plan.newid,
                                      filename=filename, size=-(-d.size // 1024), format=d.target_fmt))  # size: KiB
         print(f"{d.key}: {d.src} -> {d.volid} ({fmt_size(d.size)}, {d.state})", flush=True)
         convert(args, d, volume_path(args, d.volid))
+
+
+def execute(backend, args, plan):
+    """Create the VM, import the disks, attach them. Raises PveError; plan.disks[].volid shows what exists."""
+    run_task(backend, backend.create(f"/nodes/{plan.node}/qemu", vmid=plan.newid, **plan.create), args.timeout)
+    print(f"VM {plan.newid} created")
+    import_disks(backend, args, plan, range(len(plan.disks)))
     params = dict(plan.late)
     params.update({d.key: ",".join([d.volid] + d.opts) for d in plan.disks})
     backend.set(f"/nodes/{plan.node}/qemu/{plan.newid}/config", **params)
+
+
+def vm_stopped(backend, base):
+    return (backend.get(base + "/status/current") or {}).get("status") == "stopped"
+
+
+def execute_replace(backend, args, plan):
+    """Copy into new volumes of the VM, then swap: old disks become unusedN. plan.phase tells how far it got."""
+    base = f"/nodes/{plan.node}/qemu/{plan.vmid}"
+    import_disks(backend, args, plan, free_disk_indexes(plan, len(plan.disks)))
+    if not vm_stopped(backend, base):
+        if not args.shutdown:
+            raise PveError(f"VM {plan.vmid} was started during the copy")
+        print(f"shutting down VM {plan.vmid} (timeout {args.timeout}s)", flush=True)
+        run_task(backend, backend.create(base + "/status/shutdown", timeout=args.timeout), args.timeout + 60)
+        if not vm_stopped(backend, base):
+            raise PveError(f"VM {plan.vmid} is not stopped after the shutdown task")
+    cfg = backend.get(base + "/config") or {}
+    if cfg.get("lock"):
+        raise PveError(f"VM {plan.vmid} is locked ({cfg['lock']})")
+    changed = [d.key for d in plan.disks if parse_drive(cfg.get(d.key, ""))[0] != d.old]
+    if changed:
+        raise PveError(f"config of VM {plan.vmid} changed during the copy: {', '.join(changed)}")
+    digest = {"digest": cfg["digest"]} if cfg.get("digest") else {}
+    backend.set(base + "/config", delete=",".join(d.key for d in plan.disks), **digest)
+    plan.phase = "detached"
+    # vmgenid=1: new generation id, the guest must see that it went back in time (AD, databases)
+    backend.set(base + "/config", vmgenid="1", **{d.key: ",".join([d.volid] + d.opts) for d in plan.disks})
+    plan.phase = "done"
+
+
+def report_failure(plan, e):
+    made = [d for d in plan.disks if d.volid]
+    print(C.red(f"restore failed: {e or 'interrupted'}"), file=sys.stderr)
+    if not plan.replace:
+        print(f"left behind: VM {plan.newid} (if created){', volumes ' + ', '.join(d.volid for d in made) if made else ''}"
+              f"; remove with 'qm destroy {plan.newid} --purge' after checking", file=sys.stderr)
+    elif plan.phase == "detached":
+        print(f"VM {plan.vmid}: old disks are detached as unusedN, the restored volumes are NOT attached. attach with:",
+              file=sys.stderr)
+        for d in made:
+            print(f"  qm set {plan.vmid} --{d.key} {','.join([d.volid] + d.opts)}", file=sys.stderr)
+    else:
+        print(f"VM {plan.vmid} is unchanged, its disks were not swapped" + (
+            ". new volumes, not attached: " + ", ".join(d.volid for d in made) +
+            f"; 'qm disk rescan --vmid {plan.vmid}' lists them as unused" if made else ""), file=sys.stderr)
 
 
 def cmd_vm(backend, args):
@@ -785,13 +898,17 @@ def cmd_vm(backend, args):
         print("aborted")
         return 1
     try:
-        execute(backend, args, plan)
+        (execute_replace if plan.replace else execute)(backend, args, plan)
     except (PveError, KeyboardInterrupt) as e:
-        made = [d.volid for d in plan.disks if d.volid]
-        print(C.red(f"restore failed: {e or 'interrupted'}"), file=sys.stderr)
-        print(f"left behind: VM {plan.newid} (if created){', volumes ' + ', '.join(made) if made else ''}; "
-              f"remove with 'qm destroy {plan.newid} --purge' after checking", file=sys.stderr)
+        report_failure(plan, e)
         return 1
+    if plan.replace:
+        print(C.green(f"VM {plan.vmid}: {len(plan.disks)} disk(s) replaced, VM is stopped"))
+        for d in plan.disks:
+            print(f"  {d.key}: {d.volid} (was {d.old}, now unusedN)")
+        print(f"next: qm start {plan.vmid}. way back: stop the VM, 'qm set {plan.vmid} --<key> <old volume>'. "
+              "delete the unusedN disks when the restore is confirmed")
+        return 0
     print(C.green(f"VM {plan.newid} restored, not started, NICs are link_down"))
     print(f"next: qm start {plan.newid}, check it on the console, then enable the NICs or move the disks over")
     return 0
@@ -852,16 +969,23 @@ def build_parser():
     sp = sub.add_parser("vm", parents=[common], help="restore old images into a new VM",
                         formatter_class=argparse.RawDescriptionHelpFormatter,
                         description="Creates VM NEWID from the config of VMID and a flat copy of each disk image.\n"
-                                    "The new VM is not started, its NICs keep the MAC and get link_down=1.",
+                                    "The new VM is not started, its NICs keep the MAC and get link_down=1.\n"
+                                    "--replace instead swaps the disks of VMID: copy into new volumes, detach the old\n"
+                                    "disks as unusedN, attach the new ones. Nothing is deleted.",
                         epilog="examples:\n"
                                "  pverestore vm 100 --from daily.2026-11-18_0010 --as 9100 -n\n"
                                "  pverestore vm 100 --from daily.2026-11-18_0010 --as 9100 --snapshot before-upgrade\n"
                                "  pverestore vm 100 --from /mnt/old/images/100 --as 9100 --storage nfs-prod\n"
-                               "  pverestore vm 100 --from /mnt/old/images/100 --as 9100 --no-config")
+                               "  pverestore vm 100 --from /mnt/old/images/100 --as 9100 --no-config\n"
+                               "  pverestore vm 100 --from daily.2026-11-18_0010 --replace --shutdown -n")
     sp.add_argument("vmid", type=positive_int, metavar="VMID", help="source VM id (image names, config)")
     sp.add_argument("--from", dest="source", required=True, metavar="SNAPSHOT|DIR",
                     help="filer snapshot name (see 'sources'), or a directory with the images (contains '/')")
-    sp.add_argument("--as", dest="newid", required=True, type=positive_int, metavar="NEWID", help="free VM id")
+    sp.add_argument("--as", dest="newid", type=positive_int, metavar="NEWID", help="restore into a new VM with this free id")
+    sp.add_argument("--replace", action="store_true",
+                    help="swap the disks of VMID itself: old disks become unusedN, config and id stay")
+    sp.add_argument("--shutdown", action="store_true",
+                    help="with --replace on a running VM: shut it down after the copy, before the swap")
     sp.add_argument("--snapshot", metavar="NAME",
                     help="restore the state of this PVE snapshot (internal qcow2 or volume chain), not the last state")
     sp.add_argument("--storage", metavar="ID", help="target file storage for all disks (default: storage of each disk)")
@@ -870,7 +994,8 @@ def build_parser():
     sp.add_argument("--skip-missing", action="store_true", help="restore without disks that have no source image")
     sp.add_argument("-n", "--dry-run", action="store_true", help="show the plan only")
     sp.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
-    sp.add_argument("--timeout", type=positive_int, default=300, help="seconds for the VM create task (default 300)")
+    sp.add_argument("--timeout", type=positive_int, default=300,
+                    help="seconds for the VM create task or the shutdown (default 300)")
     return p
 
 

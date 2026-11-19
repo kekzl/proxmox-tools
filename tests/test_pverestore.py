@@ -233,6 +233,97 @@ class RestoreTests(StateCase):
         self.assertEqual((cfg["name"], cfg["boot"], cfg["scsihw"]), ("restore-100", "order=scsi0", "virtio-scsi-single"))
         self.assertNotIn("net0", cfg)
 
+    def local_guest(self, status="stopped", **extra):
+        st = self.read()
+        st["resources"][0].update(node="pve1", status=status, **extra)
+        st["vm_status"] = {"100": status}
+        self.write(st)
+
+    def test_replace(self):
+        self.local_guest()
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("REPLACE the disks of VM 100 on pve1 in place", out)
+        self.assertEqual(self.calls("create") + self.calls("set"), [])
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertEqual(rc, 0, out + err)
+        cfg = self.read()["configs"]["100"]["config"]
+        # indexes 0, 1 and 9 are taken by the config
+        self.assertEqual(cfg["scsi0"], "nfs:100/vm-100-disk-2.qcow2,discard=on,iothread=1")
+        self.assertEqual(cfg["scsi1"], "nfs:100/vm-100-disk-3.raw")
+        self.assertEqual({cfg[k] for k in ("unused0", "unused1", "unused2")},
+                         {"nfs:100/vm-100-disk-9.qcow2", "nfs:100/vm-100-disk-0.qcow2", "nfs:100/vm-100-disk-1.raw"})
+        self.assertEqual(cfg["vmgenid"], "1")
+        for key in ("name", "net0", "net1", "hostpci0", "boot", "ide0", "ide2", "onboot", "scsi2"):
+            self.assertEqual(cfg[key], CONFIG[key], key)
+        self.assertEqual(first_byte(os.path.join(self.nfs, "images", "100", "vm-100-disk-2.qcow2"), "qcow2"), 0x22)
+        self.assertEqual([c[1] for c in self.calls("create")], ["/nodes/pve1/storage/nfs/content"] * 2)
+        self.assertIn("scsi0: nfs:100/vm-100-disk-2.qcow2 (was nfs:100/vm-100-disk-0.qcow2, now unusedN)", out)
+
+    def test_replace_skips_used_file_indexes(self):
+        self.local_guest()
+        d = os.path.join(self.nfs, "images", "100")
+        os.makedirs(d)
+        for name in ("vm-100-disk-2.qcow2", "snap-old-vm-100-disk-3.qcow2"):
+            open(os.path.join(d, name), "w").close()
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertEqual(rc, 0, out + err)
+        cfg = self.read()["configs"]["100"]["config"]
+        self.assertEqual((cfg["scsi0"].split(",")[0], cfg["scsi1"]),
+                         ("nfs:100/vm-100-disk-4.qcow2", "nfs:100/vm-100-disk-5.raw"))
+
+    def test_replace_running_vm(self):
+        self.local_guest("running")
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertEqual(rc, 2)
+        self.assertIn("VM 100 is running: stop it, or pass --shutdown", err)
+        self.assertEqual(self.calls("create"), [])
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "--shutdown", "-y")
+        self.assertEqual(rc, 0, out + err)
+        paths = [c[1] for c in self.calls("create")]
+        self.assertEqual(paths[-1], "/nodes/pve1/qemu/100/status/shutdown")  # after both copies
+        self.assertEqual(len(paths), 3)
+        self.assertEqual(self.read()["configs"]["100"]["config"]["scsi0"].split(",")[0], "nfs:100/vm-100-disk-2.qcow2")
+
+    def test_replace_shutdown_fails(self):
+        self.local_guest("running")
+        st = self.read()
+        st["fail_shutdown"] = "VM quit/powerdown failed - got timeout"
+        self.write(st)
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "--shutdown", "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("VM 100 is unchanged, its disks were not swapped", err)
+        self.assertIn("nfs:100/vm-100-disk-2.qcow2, nfs:100/vm-100-disk-3.raw", err)
+        self.assertEqual(self.calls("set"), [])
+        self.assertEqual(self.read()["configs"]["100"]["config"]["scsi0"], CONFIG["scsi0"])
+
+    def test_replace_fails_after_detach(self):
+        self.local_guest()
+        st = self.read()
+        st["fail_set"] = "boom"
+        self.write(st)
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("old disks are detached as unusedN, the restored volumes are NOT attached", err)
+        self.assertIn("qm set 100 --scsi0 nfs:100/vm-100-disk-2.qcow2,discard=on,iothread=1", err)
+        self.assertIn("qm set 100 --scsi1 nfs:100/vm-100-disk-3.raw", err)
+
+    def test_replace_refusals(self):
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertIn("VM 100 is on node pve2, run pverestore there", err)
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "-y")
+        self.assertIn("pass exactly one of --as NEWID", err)
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "--replace", "-y")
+        self.assertIn("pass exactly one of --as NEWID", err)
+        rc, _, err = self.run_cli("vm", "777", "--from", "daily.0", "--replace", "-y")
+        self.assertIn("VM 777 does not exist", err)
+        self.local_guest(lock="backup")
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertIn("VM 100 is locked (backup)", err)
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "--no-config", "-y")
+        self.assertIn("not with --no-config", err)
+        self.assertEqual(self.calls("create") + self.calls("set"), [])
+
     def test_failure_reports_leftovers(self):
         st = self.read()
         st["fail_set"] = "boom"
