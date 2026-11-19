@@ -51,6 +51,20 @@ class SharedFunctionTests(unittest.TestCase):
                 for fd in (saved, master, slave):
                     os.close(fd)
 
+    def test_pvesh_create_result_is_the_last_line(self):
+        cases = {"Formatting '/x/vm-1-disk-0.qcow2', fmt=qcow2 size=1\\n\"nfs:1/vm-1-disk-0.qcow2\"": "nfs:1/vm-1-disk-0.qcow2",
+                 "Formatting '/x', fmt=qcow2\\nnfs:1/vm-1-disk-0.qcow2\\n\\n": "nfs:1/vm-1-disk-0.qcow2",
+                 "\"UPID:n:1:2:3:qmcreate:1:root@pam:\"": "UPID:n:1:2:3:qmcreate:1:root@pam:",
+                 "{\"a\": 1}": {"a": 1}, "": None}
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "pvesh")
+            for text, want in cases.items():
+                with open(fake, "w") as f:
+                    f.write(f"#!/bin/sh\nprintf '%b' '{text}'\n".replace("'/x/vm-1-disk-0.qcow2'", "/x/vm").replace(
+                        "'/x'", "/x"))
+                os.chmod(fake, 0o755)
+                self.assertEqual(S.PveshBackend(fake).create("/x"), want, text)
+
     def test_wait_task_survives_poll_errors(self):
         upid = "UPID:pve1:0001:0:0:qmdelsnapshot:100:root@pam:"
         orig, S.time.sleep = S.time.sleep, lambda s: None

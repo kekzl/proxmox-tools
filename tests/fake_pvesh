@@ -264,6 +264,10 @@ def main():
     if isinstance(out, tuple):
         print(out[1], file=sys.stderr)
         sys.exit(out[0])
+    if method == "create" and path.endswith("/content"):
+        # PVE forwards the qemu-img create output to stdout, in front of the result
+        print(f"Formatting '{st['volpaths'][out]}', fmt={params['format']} cluster_size=65536 extended_l2=on "
+              f"preallocation=metadata compression_type=zlib size={params['size']} lazy_refcounts=off refcount_bits=16")
     print(json.dumps(out))
 
 
