@@ -149,6 +149,8 @@ def handle(st, method, path, params):
         return tasks
 
     m = re.fullmatch(r"/nodes/([^/]+)/(qemu|lxc)/(\d+)/(config|pending)", path)
+    if m and method == "get" and m.group(4) == "config" and m.group(3) in st.get("conf_files", {}):
+        return dict(read_conf(st["conf_files"][m.group(3)])[""], digest="f0")
     if m:
         cfg = st.get("configs", {}).get(m.group(3))
         if cfg is None:

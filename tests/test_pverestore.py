@@ -47,6 +47,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(R.boot_params({"boot": "cdn", "bootdisk": "scsi0"}, present), {"boot": "cdn", "bootdisk": "scsi0"})
         self.assertEqual(R.boot_params({"bootdisk": "virtio0"}, present), {})
 
+    def test_drive_size_and_map(self):
+        self.assertEqual([R.drive_size(v) for v in ("nfs:1/a.qcow2,size=80G", "x,iothread=1,size=528K", "x,size=4",
+                                                    "x,discard=on")], [80 << 30, 528 << 10, 4, 0])
+        self.assertEqual(R.parse_map("scsi0=vm-1-disk-0.qcow2"), ("scsi0", "vm-1-disk-0.qcow2"))
+        for bad in ("scsi0", "scsi0=a/b.qcow2", "=x"):
+            with self.assertRaises(R.argparse.ArgumentTypeError):
+                R.parse_map(bad)
+
     def test_image_format_is_never_probed(self):
         self.assertEqual([R.image_format(n) for n in ("vm-1-disk-0.qcow2", "vm-1-disk-0.raw", "vm-1-disk-0", "a.vmdk")],
                          ["qcow2", "raw", "raw", "vmdk"])
@@ -233,44 +241,114 @@ class RestoreTests(StateCase):
         self.assertEqual((cfg["name"], cfg["boot"], cfg["scsihw"]), ("restore-100", "order=scsi0", "virtio-scsi-single"))
         self.assertNotIn("net0", cfg)
 
-    def local_guest(self, status="stopped", **extra):
+    def local_guest(self, status="stopped", scsi0="vm-100-disk-0.qcow2", scsi1="vm-100-disk-1.raw", **extra):
+        """VM 100 on pve1 with a conf file: PVE snapshot s1 (volume chain on scsi0, RAM state), unused0."""
+        root = self.tmp.name
+        self.pve, self.backups = os.path.join(root, "pve"), os.path.join(root, "backups")
+        self.conf = os.path.join(self.pve, "nodes", "pve1", "qemu-server", "100.conf")
+        os.makedirs(os.path.dirname(self.conf))
+        self.extra_args = RestoreTests.extra_args + ("--pve-dir", self.pve, "--lock-dir", os.path.join(root, "locks"),
+                                                     "--backup-dir", self.backups)
+        self.live = os.path.join(self.nfs, "images", "100")
+        os.makedirs(self.live, exist_ok=True)
+        snap = os.path.join(self.live, f"snap-s1-{scsi0}")
+        qemu("qemu-img", "create", "-q", "-f", "qcow2", snap, "8M")
+        qemu("qemu-img", "create", "-q", "-f", "qcow2", "-b", os.path.basename(snap), "-F", "qcow2",
+             os.path.join(self.live, scsi0))
+        write(os.path.join(self.live, scsi0), "0x55")
+        with open(os.path.join(self.live, scsi1), "wb") as f:
+            f.write(b"\x66" * 4 * MB)
+        qemu("qemu-img", "create", "-q", "-f", "qcow2", os.path.join(self.live, "vm-100-disk-9.qcow2"), "1M")
+        main = {k: v for k, v in CONFIG.items() if k != "digest"}
+        main.update(scsi0=f"nfs:100/{scsi0},discard=on,iothread=1,size=8M", scsi1=f"nfs:100/{scsi1},size=4M",
+                    parent="s1")
+        main.update(extra.pop("conf", {}))
+        self.original = "".join(f"{k}: {v}\n" for k, v in main.items()) + (
+            f"\n[s1]\nscsi0: nfs:100/{scsi0},discard=on,iothread=1,size=8M\nscsi1: nfs:100/{scsi1},size=4M\n"
+            "snaptime: 1700000000\nvmstate: nfs:100/vm-100-state-s1.raw\n")
+        with open(self.conf, "w") as f:
+            f.write(self.original)
         st = self.read()
         st["resources"][0].update(node="pve1", status=status, **extra)
         st["vm_status"] = {"100": status}
+        st["conf_files"] = {"100": self.conf}
+        st["content"] = {"*/nfs": [{"volid": "nfs:100/vm-100-state-s1.raw"}]}
+        st["volpaths"] = {f"nfs:100/{n}": os.path.join(self.live, n) for n in (scsi0, scsi1, "vm-100-disk-9.qcow2")}
         self.write(st)
+
+    def conf_text(self):
+        with open(self.conf) as f:
+            return f.read()
+
+    def assert_unchanged(self, files):
+        self.assertEqual(self.conf_text(), self.original)
+        self.assertEqual(sorted(os.listdir(self.live)), files)
+        self.assertEqual(first_byte(os.path.join(self.live, "vm-100-disk-0.qcow2"), "qcow2"), 0x55)
 
     def test_replace(self):
         self.local_guest()
+        files = sorted(os.listdir(self.live))
         rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-n")
         self.assertEqual(rc, 0, out + err)
-        self.assertIn("REPLACE the disks of VM 100 on pve1 in place", out)
+        self.assertIn("OVERWRITE the disks of VM 100 on pve1 in place", out)
+        self.assertIn("PVE snapshots of the VM removed with their chain files and RAM states: s1", out)
+        self.assertIn("unused0 not touched: 'pvedisk delete 100 --kind unused' removes them", out)
+        self.assertIn("the current content of these disks is lost", out)
         self.assertEqual(self.calls("create") + self.calls("set"), [])
+        self.assert_unchanged(files)
         rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
         self.assertEqual(rc, 0, out + err)
-        cfg = self.read()["configs"]["100"]["config"]
-        # indexes 0, 1 and 9 are taken by the config
-        self.assertEqual(cfg["scsi0"], "nfs:100/vm-100-disk-2.qcow2,discard=on,iothread=1")
-        self.assertEqual(cfg["scsi1"], "nfs:100/vm-100-disk-3.raw")
-        self.assertEqual({cfg[k] for k in ("unused0", "unused1", "unused2")},
-                         {"nfs:100/vm-100-disk-9.qcow2", "nfs:100/vm-100-disk-0.qcow2", "nfs:100/vm-100-disk-1.raw"})
-        self.assertEqual(cfg["vmgenid"], "1")
+        self.assertIn("VM 100: 2 disk(s) overwritten in place, VM is stopped", out)
+        self.assertIn("PVE snapshots removed: s1", out)
+        # same names, no unusedN, staging files renamed away, chain file of s1 gone
+        self.assertEqual(sorted(os.listdir(self.live)), ["vm-100-disk-0.qcow2", "vm-100-disk-1.raw", "vm-100-disk-9.qcow2"])
+        disk0 = os.path.join(self.live, "vm-100-disk-0.qcow2")
+        self.assertEqual(first_byte(disk0, "qcow2"), 0x22)
+        self.assertNotIn("backing-filename", info(disk0))
+        raw_kib = -(-os.path.getsize(os.path.join(self.daily, "vm-100-disk-1.raw")) // 1024)
+        self.assertEqual(os.path.getsize(os.path.join(self.live, "vm-100-disk-1.raw")), raw_kib * 1024)
+        text = self.conf_text()
+        self.assertNotIn("[s1]", text)
+        self.assertNotIn("parent:", text)
+        self.assertIn("scsi0: nfs:100/vm-100-disk-0.qcow2,discard=on,iothread=1,size=8M\n", text)
+        self.assertIn(f"scsi1: nfs:100/vm-100-disk-1.raw,size={raw_kib}K\n", text)
+        self.assertIn("unused0: nfs:100/vm-100-disk-9.qcow2\n", text)
+        self.assertRegex(text, r"vmgenid: [0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-")
+        self.assertNotIn(CONFIG["vmgenid"], text)
         for key in ("name", "net0", "net1", "hostpci0", "boot", "ide0", "ide2", "onboot", "scsi2"):
-            self.assertEqual(cfg[key], CONFIG[key], key)
-        self.assertEqual(first_byte(os.path.join(self.nfs, "images", "100", "vm-100-disk-2.qcow2"), "qcow2"), 0x22)
-        self.assertEqual([c[1] for c in self.calls("create")], ["/nodes/pve1/storage/nfs/content"] * 2)
-        self.assertIn("scsi0: nfs:100/vm-100-disk-2.qcow2 (was nfs:100/vm-100-disk-0.qcow2, now unusedN)", out)
+            self.assertIn(f"{key}: {CONFIG[key]}\n", text)
+        self.assertEqual(self.calls("pvesm"), [["pvesm", "free", "nfs:100/vm-100-state-s1.raw"]])
+        self.assertEqual(self.calls("set"), [])
+        backups = os.listdir(self.backups)
+        self.assertEqual(len(backups), 1)
+        with open(os.path.join(self.backups, backups[0])) as f:
+            self.assertEqual(f.read(), self.original)
 
     def test_replace_skips_used_file_indexes(self):
         self.local_guest()
-        d = os.path.join(self.nfs, "images", "100")
-        os.makedirs(d)
         for name in ("vm-100-disk-2.qcow2", "snap-old-vm-100-disk-3.qcow2"):
-            open(os.path.join(d, name), "w").close()
+            open(os.path.join(self.live, name), "w").close()
         rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
         self.assertEqual(rc, 0, out + err)
-        cfg = self.read()["configs"]["100"]["config"]
-        self.assertEqual((cfg["scsi0"].split(",")[0], cfg["scsi1"]),
-                         ("nfs:100/vm-100-disk-4.qcow2", "nfs:100/vm-100-disk-5.raw"))
+        self.assertEqual([c[2]["filename"] for c in self.calls("create")], ["vm-100-disk-4.qcow2", "vm-100-disk-5.raw"])
+        self.assertEqual(sorted(os.listdir(self.live)), ["snap-old-vm-100-disk-3.qcow2", "vm-100-disk-0.qcow2",
+                                                         "vm-100-disk-1.raw", "vm-100-disk-2.qcow2",
+                                                         "vm-100-disk-9.qcow2"])
+
+    def test_replace_renamed_disks_matched_by_size(self):
+        # state after a swap by an older pverestore: config names disk-2/disk-3, the snapshot holds disk-0/disk-1
+        raw_kib = -(-os.path.getsize(os.path.join(self.daily, "vm-100-disk-1.raw")) // 1024)
+        self.local_guest(scsi0="vm-100-disk-2.qcow2", scsi1="vm-100-disk-3.raw",
+                         conf={"scsi1": f"nfs:100/vm-100-disk-3.raw,size={raw_kib}K"})
+        for _ in range(2):
+            rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+            self.assertEqual(rc, 0, out + err)
+            self.assertIn("scsi0: vm-100-disk-2.qcow2 is not in the source, took vm-100-disk-0.qcow2: same size 8.0 MiB",
+                          out)
+            self.assertIn("scsi1: vm-100-disk-3.raw is not in the source, took vm-100-disk-1.raw", out)
+            self.assertEqual(sorted(os.listdir(self.live)),
+                             ["vm-100-disk-2.qcow2", "vm-100-disk-3.raw", "vm-100-disk-9.qcow2"])
+            self.assertEqual(first_byte(os.path.join(self.live, "vm-100-disk-2.qcow2"), "qcow2"), 0x22)
 
     def test_replace_running_vm(self):
         self.local_guest("running")
@@ -283,30 +361,45 @@ class RestoreTests(StateCase):
         paths = [c[1] for c in self.calls("create")]
         self.assertEqual(paths[-1], "/nodes/pve1/qemu/100/status/shutdown")  # after both copies
         self.assertEqual(len(paths), 3)
-        self.assertEqual(self.read()["configs"]["100"]["config"]["scsi0"].split(",")[0], "nfs:100/vm-100-disk-2.qcow2")
+        self.assertEqual(first_byte(os.path.join(self.live, "vm-100-disk-0.qcow2"), "qcow2"), 0x22)
 
     def test_replace_shutdown_fails(self):
         self.local_guest("running")
+        files = sorted(os.listdir(self.live))
         st = self.read()
         st["fail_shutdown"] = "VM quit/powerdown failed - got timeout"
         self.write(st)
         rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "--shutdown", "-y")
         self.assertEqual(rc, 1)
-        self.assertIn("VM 100 is unchanged, its disks were not swapped", err)
-        self.assertIn("nfs:100/vm-100-disk-2.qcow2, nfs:100/vm-100-disk-3.raw", err)
-        self.assertEqual(self.calls("set"), [])
-        self.assertEqual(self.read()["configs"]["100"]["config"]["scsi0"], CONFIG["scsi0"])
+        self.assertIn("VM 100 is unchanged", err)
+        self.assert_unchanged(files)  # staging volumes removed
 
-    def test_replace_fails_after_detach(self):
+    def test_replace_lock_appears_before_swap(self):
         self.local_guest()
+        files = sorted(os.listdir(self.live))
+        self.original = self.original.replace("parent: s1\n", "parent: s1\nlock: backup\n")
+        with open(self.conf, "w") as f:
+            f.write(self.original)
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertEqual(rc, 1)
+        self.assertIn("VM 100 is locked (backup)", err)
+        self.assertIn("VM 100 is unchanged", err)
+        self.assert_unchanged(files)
+
+    def test_replace_fails_during_swap(self):
+        self.local_guest()
+        blocker = os.path.join(self.tmp.name, "blocker")
+        os.makedirs(os.path.join(blocker, "x"))
         st = self.read()
-        st["fail_set"] = "boom"
+        st["volpaths"]["nfs:100/vm-100-disk-1.raw"] = blocker  # rename onto a non-empty directory fails
         self.write(st)
         rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
         self.assertEqual(rc, 1)
-        self.assertIn("old disks are detached as unusedN, the restored volumes are NOT attached", err)
-        self.assertIn("qm set 100 --scsi0 nfs:100/vm-100-disk-2.qcow2,discard=on,iothread=1", err)
-        self.assertIn("qm set 100 --scsi1 nfs:100/vm-100-disk-3.raw", err)
+        self.assertIn("config written (backup ", err)
+        self.assertIn(f"  mv {os.path.join(self.live, 'vm-100-disk-3.raw')} {blocker}", err)
+        self.assertNotIn("  mv " + os.path.join(self.live, "vm-100-disk-2.qcow2"), err)
+        self.assertEqual(first_byte(os.path.join(self.live, "vm-100-disk-0.qcow2"), "qcow2"), 0x22)
+        self.assertNotIn("[s1]", self.conf_text())
 
     def test_replace_refusals(self):
         rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
@@ -322,7 +415,34 @@ class RestoreTests(StateCase):
         self.assertIn("VM 100 is locked (backup)", err)
         rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "--no-config", "-y")
         self.assertIn("not with --no-config", err)
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "--storage", "nfs", "-y")
+        self.assertIn("not with --storage", err)
         self.assertEqual(self.calls("create") + self.calls("set"), [])
+
+    def test_renamed_disk_ambiguous_size_needs_map(self):
+        st = self.read()
+        st["configs"]["100"]["config"]["scsi0"] = "nfs:100/vm-100-disk-5.qcow2,discard=on,size=8M"
+        self.write(st)
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "-n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("scsi0: vm-100-disk-5.qcow2 is not in the source, took vm-100-disk-0.qcow2", out)
+        qemu("qemu-img", "create", "-q", "-f", "qcow2", os.path.join(self.daily, "vm-100-disk-8.qcow2"), "8M")
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "-y")
+        self.assertEqual(rc, 2)
+        self.assertIn("vm-100-disk-0.qcow2 8.0 MiB written", out)
+        self.assertIn("vm-100-disk-8.qcow2 8.0 MiB written", out)
+        self.assertIn("choose with --map scsi0=IMAGE", out)
+        self.assertEqual(self.calls("create"), [])
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "--map", "scsi7=x.qcow2", "-y")
+        self.assertIn("--map scsi7: not a disk in the config of 100 (disks: scsi0, scsi1)", err)
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "--no-config",
+                                  "--map", "scsi0=x.qcow2", "-y")
+        self.assertIn("--map needs the guest config", err)
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100",
+                                    "--map", "scsi0=vm-100-disk-0.qcow2", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("not in the guest config, not restored: vm-100-disk-7.qcow2, vm-100-disk-8.qcow2", out)
+        self.assertEqual(first_byte(self.target(0), "qcow2"), 0x22)
 
     def test_failure_reports_leftovers(self):
         st = self.read()

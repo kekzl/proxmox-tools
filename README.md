@@ -194,7 +194,7 @@ Templates are skipped unless `--templates`.
 
 ## pverestore
 
-Restores a VM from old disk images into a new VM: a filer snapshot (`.snapshot` on NetApp/NFS, `.zfs/snapshot`) or any directory with the images. Every disk is copied flat with `qemu-img convert`, so internal qcow2 snapshots and backing chains do not survive. The source is only read, the original VM is not touched unless `--replace` is given. Root on a node, no API mode, QEMU only.
+Restores a VM from old disk images into a new VM: a filer snapshot (`.snapshot` on NetApp/NFS, `.zfs/snapshot`) or any directory with the images. Every disk is copied flat with `qemu-img convert`, so internal qcow2 snapshots and backing chains do not survive. The source is only read, the original VM is not touched unless `--replace` is given, which overwrites its disks. Root on a node, no API mode, QEMU only.
 
 | Example | Action |
 |---|---|
@@ -204,8 +204,9 @@ Restores a VM from old disk images into a new VM: a filer snapshot (`.snapshot` 
 | `pverestore vm 100 --from daily.0 --as 9100 --snapshot before-upgrade` | state of that PVE snapshot: internal qcow2 snapshot or `snap-<name>-*` chain file |
 | `pverestore vm 100 --from /mnt/old/images/100 --as 9100 --storage nfs-prod` | images from a directory, all disks to one target storage |
 | `pverestore vm 100 --from /mnt/old/images/100 --as 9100 --storage nfs-prod --no-config` | VM 100 is gone or the id was reused: minimal VM, every image as `scsiN` |
-| `pverestore vm 100 --from daily.0 --replace -n` | plan for swapping the disks of VM 100 itself |
-| `pverestore vm 100 --from daily.0 --replace --shutdown` | copy while VM 100 runs, shut it down, swap the disks, leave it stopped |
+| `pverestore vm 100 --from daily.0 --replace -n` | plan for overwriting the disks of VM 100 itself in place |
+| `pverestore vm 100 --from daily.0 --replace --shutdown` | copy while VM 100 runs, shut it down, overwrite the disks, leave it stopped |
+| `pverestore vm 100 --from daily.0 --replace --map scsi0=vm-100-disk-0.qcow2` | source image for scsi0 chosen by hand: the config names a volume the snapshot does not hold |
 
 | Topic | Behaviour |
 |---|---|
@@ -215,30 +216,34 @@ Restores a VM from old disk images into a new VM: a filer snapshot (`.snapshot` 
 | cloud-init drive | new drive on the target storage, not the volume of the original |
 | image format | from the file extension, never probed: a guest can write a qcow2 header into a raw disk |
 | backing chain | every file must be inside the source, else refused: the result would mix two points in time |
+| disk image renamed since the snapshot | config names `vm-100-disk-2`, source has `vm-100-disk-0` (e.g. after a swap by pverestore < 0.3): the one unclaimed source image with the drive's `size=` is taken and noted; ambiguous or no size match: refused with the candidates, `--map scsi0=vm-100-disk-0.qcow2` picks one |
 | disk without source image | refused, `--skip-missing` restores without it |
 | image not in the config | listed, not restored (`--no-config` restores all) |
 | target | file storages only (`dir`, `nfs`, `cifs`, `cephfs`, `glusterfs`), default: storage of each disk; move later with `qm disk move` |
 | failure | nothing is deleted, the leftover VM and volumes are listed with the `qm destroy` command |
 | consistency | a filer snapshot of a running VM is crash-consistent: expect journal replay, databases run recovery |
 
-`--replace` keeps VM id, config, NICs and backup jobs and swaps only the disks:
+`--replace` keeps VM id, config, NICs and backup jobs and overwrites the disks in place: same volume names, no `unusedN`, no second copy left behind.
 
 | Step | Action |
 |---|---|
-| 1 | copy every disk into a new volume `vm-<vmid>-disk-N` of the VM (N unused in config and on disk); the VM may keep running |
+| 1 | copy every disk into a staging file `vm-<vmid>-disk-N` next to it (N unused in config and on disk); the VM may keep running |
 | 2 | VM must be stopped: refused if it runs, `--shutdown` shuts it down here (`--timeout`, default 300 s) |
-| 3 | config re-read: refused if a lock appeared or a disk key changed during the copy |
-| 4 | old disks detached, they stay as `unusedN`; new volumes attached with the old drive options; `vmgenid` renewed |
-| 5 | VM is left stopped: `qm start` after a look at the plan output |
+| 3 | config lock taken (`qm start` waits), config re-read: refused if a lock appeared or a disk key changed during the copy |
+| 4 | config backed up to `/var/backups/pverestore`, then written: PVE snapshot sections and `parent` removed, `size=` of each disk set, `vmgenid` renewed |
+| 5 | each staging file renamed onto its old volume; then the `snap-<name>-*` chain files and RAM states of the removed snapshots are deleted |
+| 6 | VM is left stopped: `qm start` after a look at the plan output |
 
 | `--replace` topic | Behaviour |
 |---|---|
-| refused | VM on another node, template, locked, `--no-config`, running without `--shutdown` |
-| way back | stop the VM, `qm set <vmid> --<key> <old volume>`; nothing is deleted |
-| PVE snapshots of the VM | keep pointing to the old disks, a rollback brings those back; `unusedN` cannot be deleted before them |
-| `--skip-missing` | a disk without source keeps its current content: mixed points in time, shown in the plan |
-| failure before the swap | VM unchanged, new volumes are listed |
-| failure between detach and attach | the `qm set` commands that attach the restored volumes are printed |
+| refused | VM on another node, template, locked, `--no-config`, `--storage`, running without `--shutdown`, volume neither qcow2 nor raw |
+| way back | none from pverestore: the old content is gone, only a newer filer snapshot brings it back |
+| PVE snapshots of the VM | removed, listed in the plan: they described the overwritten content |
+| `unusedN` | not touched, the plan names them; `pvedisk delete <vmid> --kind unused` removes them |
+| disk size | as in the source, a change is shown in the plan |
+| `--skip-missing` | a disk without source keeps its current content and its chain files: mixed points in time, shown in the plan |
+| failure before the config write | VM unchanged, staging files removed |
+| failure during the renames | config is written, the `mv` commands for the disks not yet swapped are printed |
 
 ## Development
 
