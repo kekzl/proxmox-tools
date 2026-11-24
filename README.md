@@ -206,6 +206,7 @@ Restores a VM from old disk images into a new VM: a filer snapshot (`.snapshot` 
 | `pverestore vm 100 --from /mnt/old/images/100 --as 9100 --storage nfs-prod --no-config` | VM 100 is gone or the id was reused: minimal VM, every image as `scsiN` |
 | `pverestore vm 100 --from daily.0 --replace -n` | plan for swapping the disks of VM 100 itself |
 | `pverestore vm 100 --from daily.0 --replace --shutdown` | copy while VM 100 runs, shut it down, swap the disks, leave it stopped |
+| `pverestore vm 100 --from daily.0 --replace --map scsi0=vm-100-disk-0.qcow2` | source image for scsi0 chosen by hand: the config names a volume the snapshot does not hold |
 
 | Topic | Behaviour |
 |---|---|
@@ -215,6 +216,7 @@ Restores a VM from old disk images into a new VM: a filer snapshot (`.snapshot` 
 | cloud-init drive | new drive on the target storage, not the volume of the original |
 | image format | from the file extension, never probed: a guest can write a qcow2 header into a raw disk |
 | backing chain | every file must be inside the source, else refused: the result would mix two points in time |
+| disk image renamed since the snapshot | config names `vm-100-disk-2`, source has `vm-100-disk-0` (e.g. after `--replace`): the one unclaimed source image with the drive's `size=` is taken and noted; ambiguous or no size match: refused with the candidates, `--map scsi0=vm-100-disk-0.qcow2` picks one |
 | disk without source image | refused, `--skip-missing` restores without it |
 | image not in the config | listed, not restored (`--no-config` restores all) |
 | target | file storages only (`dir`, `nfs`, `cifs`, `cephfs`, `glusterfs`), default: storage of each disk; move later with `qm disk move` |

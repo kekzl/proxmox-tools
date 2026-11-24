@@ -47,6 +47,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(R.boot_params({"boot": "cdn", "bootdisk": "scsi0"}, present), {"boot": "cdn", "bootdisk": "scsi0"})
         self.assertEqual(R.boot_params({"bootdisk": "virtio0"}, present), {})
 
+    def test_drive_size_and_map(self):
+        self.assertEqual([R.drive_size(v) for v in ("nfs:1/a.qcow2,size=80G", "x,iothread=1,size=528K", "x,size=4",
+                                                    "x,discard=on")], [80 << 30, 528 << 10, 4, 0])
+        self.assertEqual(R.parse_map("scsi0=vm-1-disk-0.qcow2"), ("scsi0", "vm-1-disk-0.qcow2"))
+        for bad in ("scsi0", "scsi0=a/b.qcow2", "=x"):
+            with self.assertRaises(R.argparse.ArgumentTypeError):
+                R.parse_map(bad)
+
     def test_image_format_is_never_probed(self):
         self.assertEqual([R.image_format(n) for n in ("vm-1-disk-0.qcow2", "vm-1-disk-0.raw", "vm-1-disk-0", "a.vmdk")],
                          ["qcow2", "raw", "raw", "vmdk"])
@@ -271,6 +279,46 @@ class RestoreTests(StateCase):
         cfg = self.read()["configs"]["100"]["config"]
         self.assertEqual((cfg["scsi0"].split(",")[0], cfg["scsi1"]),
                          ("nfs:100/vm-100-disk-4.qcow2", "nfs:100/vm-100-disk-5.raw"))
+
+    def test_replace_twice_matches_renamed_disks_by_size(self):
+        self.local_guest()
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertEqual(rc, 0, out + err)
+        # config now names disk-2/disk-3 (no size=), the snapshot holds disk-0/disk-1: size of the current volume decides
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--replace", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("scsi0: vm-100-disk-2.qcow2 is not in the source, took vm-100-disk-0.qcow2: same size 8.0 MiB", out)
+        self.assertIn("scsi1: vm-100-disk-3.raw is not in the source, took vm-100-disk-1.raw", out)
+        self.assertIn("not in the guest config, not restored: vm-100-disk-7.qcow2", out)
+        cfg = self.read()["configs"]["100"]["config"]
+        self.assertEqual((cfg["scsi0"].split(",")[0], cfg["scsi1"]),
+                         ("nfs:100/vm-100-disk-4.qcow2", "nfs:100/vm-100-disk-5.raw"))
+        self.assertEqual(first_byte(os.path.join(self.nfs, "images", "100", "vm-100-disk-4.qcow2"), "qcow2"), 0x22)
+
+    def test_renamed_disk_ambiguous_size_needs_map(self):
+        st = self.read()
+        st["configs"]["100"]["config"]["scsi0"] = "nfs:100/vm-100-disk-5.qcow2,discard=on,size=8M"
+        self.write(st)
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "-n")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("scsi0: vm-100-disk-5.qcow2 is not in the source, took vm-100-disk-0.qcow2", out)
+        qemu("qemu-img", "create", "-q", "-f", "qcow2", os.path.join(self.daily, "vm-100-disk-8.qcow2"), "8M")
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "-y")
+        self.assertEqual(rc, 2)
+        self.assertIn("vm-100-disk-0.qcow2 8.0 MiB written", out)
+        self.assertIn("vm-100-disk-8.qcow2 8.0 MiB written", out)
+        self.assertIn("choose with --map scsi0=IMAGE", out)
+        self.assertEqual(self.calls("create"), [])
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "--map", "scsi7=x.qcow2", "-y")
+        self.assertIn("--map scsi7: not a disk in the config of 100 (disks: scsi0, scsi1)", err)
+        rc, _, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100", "--no-config",
+                                  "--map", "scsi0=x.qcow2", "-y")
+        self.assertIn("--map needs the guest config", err)
+        rc, out, err = self.run_cli("vm", "100", "--from", "daily.0", "--as", "9100",
+                                    "--map", "scsi0=vm-100-disk-0.qcow2", "-y")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("not in the guest config, not restored: vm-100-disk-7.qcow2, vm-100-disk-8.qcow2", out)
+        self.assertEqual(first_byte(self.target(0), "qcow2"), 0x22)
 
     def test_replace_running_vm(self):
         self.local_guest("running")

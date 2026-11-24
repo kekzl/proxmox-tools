@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # ==== shared:begin
 UPID_RE = re.compile(r"UPID:[^\s\"']+")
@@ -457,6 +457,8 @@ class Disk:
     missing: bool = False
     volid: str = ""
     old: str = ""        # volume the key points to in the guest config
+    cfg_size: int = 0    # size= of the drive in the guest config, bytes
+    mapped: bool = False  # image name chosen with --map
 
 
 @dataclass
@@ -604,6 +606,25 @@ def parse_drive(value):
     return vol, [o for o in rest.split(",") if o and not o.startswith("size=")]
 
 
+SIZE_UNITS = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+
+
+def drive_size(value):
+    """size=80G of a drive value -> bytes, 0 if absent or unreadable."""
+    for o in str(value).split(","):
+        m = re.fullmatch(r"size=(\d+(?:\.\d+)?)([KMGT]?)", o)
+        if m:
+            return int(float(m.group(1)) * SIZE_UNITS[m.group(2)])
+    return 0
+
+
+def parse_map(text):
+    m = re.fullmatch(r"([a-z]+\d+)=([^/=\s]+)", text)
+    if not m:
+        raise argparse.ArgumentTypeError(f"invalid --map '{text}' (example: scsi0=vm-100-disk-0.qcow2)")
+    return m.group(1), m.group(2)
+
+
 def split_config(cfg, cloudinit_storage=None):
     """Guest config -> (create params, late drive params, disks, notes). Late = set after the import."""
     create, late, disks, notes = {}, {}, [], []
@@ -635,7 +656,8 @@ def split_config(cfg, cloudinit_storage=None):
             notes.append(f"{key} not copied: {vol} is not a storage volume")
         else:
             sid, volname = vol.split(":", 1)
-            disks.append(Disk(key=key, opts=opts, sid=sid, name=os.path.basename(volname), old=vol))
+            disks.append(Disk(key=key, opts=opts, sid=sid, name=os.path.basename(volname), old=vol,
+                              cfg_size=drive_size(value)))
     return create, late, disks, notes
 
 
@@ -662,6 +684,57 @@ def minimal_disks(dirs, vmid):
             if m and int(m.group(1)) == vmid:
                 disks.append(Disk(key=f"scsi{len(disks)}", opts=[], sid=sid, name=name))
     return disks
+
+
+def match_renamed(args, disks, dirs):
+    """Config names a volume the source lacks (renamed since, e.g. by --replace): take the one unclaimed image
+    of the source with the drive's size= when no other missing disk wants it. Returns plan notes."""
+    def src(x):
+        return dirs.get("") or dirs.get(x.sid)
+
+    notes, by_dir, cands = [], {}, {}
+    for x in disks:
+        if not x.missing or x.mapped or not src(x):
+            continue
+        d = src(x)[1]
+        if d not in by_dir:
+            claimed = {y.name for y in disks if not y.missing and src(y) == src(x)}
+            by_dir[d] = []
+            for n in sorted(os.listdir(d)):
+                m = IMAGE_RE.match(n)
+                if not m or int(m.group(1)) != args.vmid or n in claimed:
+                    continue
+                path = os.path.join(d, n)
+                try:
+                    by_dir[d].append((n, int(image_info(args, path, image_format(n))[0]["virtual-size"]),
+                                      os.path.getmtime(path)))
+                except PveError:
+                    continue
+        cands[x.key] = by_dir[d]
+        if not x.cfg_size and x.old:  # no size= in the config: size of the current volume
+            try:
+                path = volume_path(args, x.old)
+                x.cfg_size = int(image_info(args, path, image_format(path))[0]["virtual-size"])
+            except PveError:
+                pass
+    def kib(n):  # import_disks allocates in KiB: a restored volume is the source rounded up
+        return -(-n // 1024)
+
+    hits = {x.key: [n for n, s, _ in cands[x.key] if x.cfg_size and kib(s) == kib(x.cfg_size)]
+            for x in disks if x.key in cands}
+    for x in disks:
+        if x.key not in hits:
+            continue
+        h = hits[x.key]
+        if len(h) == 1 and sum(h[0] in o for o in hits.values()) == 1:
+            old, x.name, x.error, x.missing = x.name, h[0], "", False
+            resolve_disk(args, x, *src(x))
+            notes.append(f"{x.key}: {old} is not in the source, took {h[0]}: same size {fmt_size(x.cfg_size)} "
+                         f"(--map {x.key}=IMAGE to choose another)")
+        elif cands[x.key]:
+            listed = ", ".join(f"{n} {fmt_size(s)} written {fmt_time(t)}" for n, s, t in cands[x.key])
+            x.error += f"; source images not in the config: {listed}: choose with --map {x.key}=IMAGE"
+    return notes
 
 
 def check_replace(args, guest, node):
@@ -731,12 +804,21 @@ def build_plan(backend, args):
         disks = minimal_disks(dirs, args.vmid)
         if disks:
             cfg["boot"] = f"order={disks[0].key}"
+    by_key = {d.key: d for d in disks}
+    for key, image in args.map or []:
+        if args.no_config or not guest:
+            raise PveError("--map needs the guest config of the VM: not with --no-config")
+        if key not in by_key:
+            raise PveError(f"--map {key}: not a disk in the config of {args.vmid} (disks: {', '.join(by_key) or 'none'})")
+        by_key[key].name, by_key[key].mapped = image, True
     for d in disks:
         src = dirs.get("") or dirs.get(d.sid)
         if src is None:
             d.error, d.missing = f"storage {d.sid} has no filer snapshot '{args.source}' with images of {args.vmid}", True
         else:
             resolve_disk(args, d, *src)
+    matched = match_renamed(args, disks, dirs)
+    for d in disks:
         d.target = args.storage or d.sid
         d.target_fmt = d.fmt if d.fmt in ("qcow2", "raw") else "qcow2"
         if not d.error and (d.target not in storages or "images" not in str(
@@ -764,6 +846,7 @@ def build_plan(backend, args):
         notes += [f"{d.key} keeps its current content: restored and old disks will be from different points in time"
                   for d in split_config(cfg)[2] if d.key not in {x.key for x in disks}]
         notes.append("old disks stay attached as unusedN; PVE snapshots of the VM keep pointing to them")
+    notes = matched + notes
     return Plan(vmid=args.vmid, newid=args.newid, node=node, create=create, late=late, disks=disks, notes=notes,
                 replace=args.replace, running=bool(guest) and guest.get("status") != "stopped", storages=storages,
                 config_text=json.dumps(cfg))
@@ -999,6 +1082,9 @@ def build_parser():
     sp.add_argument("--storage", metavar="ID", help="target file storage for all disks (default: storage of each disk)")
     sp.add_argument("--no-config", action="store_true",
                     help="ignore the config of VMID: minimal VM with every image of the source as scsiN")
+    sp.add_argument("--map", action="append", type=parse_map, metavar="KEY=IMAGE",
+                    help="take this source image for drive KEY (repeatable), e.g. scsi0=vm-100-disk-0.qcow2; "
+                         "default: the image the config names, else the one unclaimed image of the same size")
     sp.add_argument("--skip-missing", action="store_true", help="restore without disks that have no source image")
     sp.add_argument("-n", "--dry-run", action="store_true", help="show the plan only")
     sp.add_argument("-y", "--yes", action="store_true", help="no confirmation prompt")
